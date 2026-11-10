@@ -1,4 +1,4 @@
-﻿const express = require("express");
+const express = require("express");
 
 const {
   loginPlatformAdmin,
@@ -12,6 +12,8 @@ const {
   authenticatePlatformAdmin,
 } = require("../middleware/platformAdminMiddleware");
 
+const { getPlatformAuditLogs } = require("../controllers/platformAuditController");
+
 const router = express.Router();
 
 // Public login
@@ -24,4 +26,10 @@ router.get(
   getPlatformDashboardStats
 );
 
+// Protected, read-only platform audit history.
+router.get(
+  "/audit-logs",
+  authenticatePlatformAdmin,
+  getPlatformAuditLogs
+);
 module.exports = router;

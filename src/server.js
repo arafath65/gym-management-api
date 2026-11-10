@@ -8,6 +8,7 @@ const branchRoutes = require("./routes/branchRoutes");
 const deviceRoutes = require("./routes/deviceRoutes");
 
 const platformAdminRoutes = require("./routes/platformAdminRoutes");
+const licenseRoutes = require("./routes/licenseRoutes");
 
 const app = express();
 
@@ -18,6 +19,7 @@ app.use("/api/branches", branchRoutes);
 app.use("/api/devices", deviceRoutes);
 
 app.use("/api/platform-admin", platformAdminRoutes);
+app.use("/api/licenses", licenseRoutes);
 
 
 app.get("/", (req, res) => {

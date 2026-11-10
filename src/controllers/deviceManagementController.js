@@ -1,4 +1,4 @@
-﻿const crypto = require("crypto");
+const crypto = require("crypto");
 const db = require("../config/db");
 const { writePlatformAuditLog } = require("../services/platformAuditService");
 
@@ -128,10 +128,12 @@ const lockOrganizationAndCheckLicense = async (
 
 const getDevices = async (req, res) => {
   try {
-    const { status, organizationId, search } = req.query;
+    const { status, organizationId, branchId, search } = req.query;
 
     const allowedStatuses = ["pending", "active", "revoked"];
+    const allowedLimits = [25, 50, 100];
 
+    // Validate status.
     if (status && !allowedStatuses.includes(status)) {
       return res.status(400).json({
         success: false,
@@ -139,16 +141,33 @@ const getDevices = async (req, res) => {
       });
     }
 
-    const conditions = [];
-    const params = [];
+    // Validate pagination.
+    const page = Number(req.query.page || 1);
+    const limit = Number(req.query.limit || 25);
 
-    if (status) {
-      conditions.push("d.status = ?");
-      params.push(status);
+    if (!Number.isInteger(page) || page < 1) {
+      return res.status(400).json({
+        success: false,
+        message: "Page must be a positive integer",
+      });
     }
 
-    if (organizationId !== undefined) {
-      const orgId = Number(organizationId);
+    if (!allowedLimits.includes(limit)) {
+      return res.status(400).json({
+        success: false,
+        message: "Page size must be 25, 50 or 100",
+      });
+    }
+
+    // Validate organization filter.
+    let orgId = null;
+
+    if (
+      organizationId !== undefined &&
+      organizationId !== null &&
+      String(organizationId).trim() !== ""
+    ) {
+      orgId = Number(organizationId);
 
       if (!Number.isInteger(orgId) || orgId <= 0) {
         return res.status(400).json({
@@ -156,13 +175,48 @@ const getDevices = async (req, res) => {
           message: "Invalid organization ID",
         });
       }
-
-      conditions.push("d.organization_id = ?");
-      params.push(orgId);
     }
 
-    if (search && String(search).trim()) {
-      conditions.push(
+    // Validate branch filter.
+    let selectedBranchId = null;
+
+    if (
+      branchId !== undefined &&
+      branchId !== null &&
+      String(branchId).trim() !== ""
+    ) {
+      selectedBranchId = Number(branchId);
+
+      if (
+        !Number.isInteger(selectedBranchId) ||
+        selectedBranchId <= 0
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid branch ID",
+        });
+      }
+    }
+
+    // Base filters apply to status counts and device results.
+    const baseConditions = [];
+    const baseParams = [];
+
+    if (orgId !== null) {
+      baseConditions.push("d.organization_id = ?");
+      baseParams.push(orgId);
+    }
+
+    if (selectedBranchId !== null) {
+      baseConditions.push("d.registered_branch_id = ?");
+      baseParams.push(selectedBranchId);
+    }
+
+    const searchTerm =
+      typeof search === "string" ? search.trim() : "";
+
+    if (searchTerm) {
+      baseConditions.push(
         `CONCAT_WS(' ',
           d.device_name,
           d.device_uuid,
@@ -172,14 +226,87 @@ const getDevices = async (req, res) => {
           b.branch_code
         ) LIKE ?`
       );
-      params.push(`%${String(search).trim()}%`);
+
+      baseParams.push(`%${searchTerm}%`);
     }
 
-    const whereClause =
-      conditions.length > 0
-        ? `WHERE ${conditions.join(" AND ")}`
+    const baseWhereClause =
+      baseConditions.length > 0
+        ? `WHERE ${baseConditions.join(" AND ")}`
         : "";
 
+    // Add selected status to the device result filters.
+    const deviceConditions = [...baseConditions];
+    const deviceParams = [...baseParams];
+
+    if (status) {
+      deviceConditions.push("d.status = ?");
+      deviceParams.push(status);
+    }
+
+    const deviceWhereClause =
+      deviceConditions.length > 0
+        ? `WHERE ${deviceConditions.join(" AND ")}`
+        : "";
+
+    // Reusable joins. Search can reference organization and branch.
+    const deviceJoins = `
+      FROM devices d
+      INNER JOIN organizations o
+        ON o.id = d.organization_id
+      LEFT JOIN branches b
+        ON b.id = d.registered_branch_id
+        AND b.organization_id = d.organization_id
+    `;
+
+    // Total matching devices for the selected filters.
+    const [countRows] = await db.query(
+      `SELECT COUNT(*) AS total
+       ${deviceJoins}
+       ${deviceWhereClause}`,
+      deviceParams
+    );
+
+    const total = Number(countRows[0].total);
+    const totalPages = Math.ceil(total / limit);
+
+    // Keep pagination valid if records were removed from a later page.
+    const currentPage =
+      totalPages === 0 ? 1 : Math.min(page, totalPages);
+
+    const offset = (currentPage - 1) * limit;
+
+    // Status counts respect organization, branch and search,
+    // but intentionally ignore the selected status.
+    const [statusRows] = await db.query(
+      `SELECT d.status, COUNT(*) AS total
+       ${deviceJoins}
+       ${baseWhereClause}
+       GROUP BY d.status`,
+      baseParams
+    );
+
+    const statusCounts = {
+      all: 0,
+      pending: 0,
+      active: 0,
+      revoked: 0,
+    };
+
+    for (const row of statusRows) {
+      const deviceStatus = row.status;
+
+      if (Object.prototype.hasOwnProperty.call(
+        statusCounts,
+        deviceStatus
+      )) {
+        statusCounts[deviceStatus] = Number(row.total);
+      }
+
+      statusCounts.all += Number(row.total);
+    }
+
+    // Fetch only the requested page.
     const [devices] = await db.query(
       `SELECT
          d.id,
@@ -204,14 +331,7 @@ const getDevices = async (req, res) => {
          l.license_status,
          l.max_devices
 
-       FROM devices d
-
-       INNER JOIN organizations o
-         ON o.id = d.organization_id
-
-       LEFT JOIN branches b
-         ON b.id = d.registered_branch_id
-         AND b.organization_id = d.organization_id
+       ${deviceJoins}
 
        LEFT JOIN licenses l
          ON l.id = (
@@ -222,16 +342,31 @@ const getDevices = async (req, res) => {
            LIMIT 1
          )
 
-       ${whereClause}
+       ${deviceWhereClause}
 
-       ORDER BY d.created_at DESC, d.id DESC`,
-      params
+       ORDER BY d.created_at DESC, d.id DESC
+       LIMIT ? OFFSET ?`,
+      [...deviceParams, limit, offset]
     );
 
     return res.json({
       success: true,
-      count: devices.length,
       devices,
+      pagination: {
+        page: currentPage,
+        limit,
+        total,
+        totalPages,
+        hasPreviousPage: currentPage > 1,
+        hasNextPage: currentPage < totalPages,
+      },
+      statusCounts,
+      filters: {
+        status: status || "all",
+        organizationId: orgId,
+        branchId: selectedBranchId,
+        search: searchTerm,
+      },
     });
   } catch (error) {
     console.error("Get devices error:", error);
@@ -242,12 +377,6 @@ const getDevices = async (req, res) => {
     });
   }
 };
-
-// ---------------------------------------------------------
-// REGISTER DEVICE
-// POST /api/devices/register
-// ---------------------------------------------------------
-
 const registerDevice = async (req, res) => {
   let connection;
   let transactionStarted = false;
