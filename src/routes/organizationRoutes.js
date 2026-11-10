@@ -1,4 +1,5 @@
-﻿const express = require("express");
+﻿
+const express = require("express");
 
 const {
   createOrganization,
@@ -9,19 +10,34 @@ const {
 
 const {
   authenticatePlatformAdmin,
+  requirePlatformPermission,
 } = require("../middleware/platformAdminMiddleware");
 
 const router = express.Router();
 
 router.use(authenticatePlatformAdmin);
 
-router.get("/", getOrganizations);
-router.post("/", createOrganization);
+router.get(
+  "/",
+  requirePlatformPermission("organizations.view"),
+  getOrganizations
+);
 
-router.put("/:organizationId", updateOrganization);
+router.post(
+  "/",
+  requirePlatformPermission("organizations.create"),
+  createOrganization
+);
+
+router.put(
+  "/:organizationId",
+  requirePlatformPermission("organizations.update"),
+  updateOrganization
+);
 
 router.patch(
   "/:organizationId/status",
+  requirePlatformPermission("organizations.suspend"),
   setOrganizationStatus
 );
 

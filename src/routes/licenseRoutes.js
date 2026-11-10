@@ -1,3 +1,4 @@
+
 const express = require("express");
 
 const {
@@ -10,17 +11,46 @@ const {
 
 const {
   authenticatePlatformAdmin,
+  requirePlatformPermission,
 } = require("../middleware/platformAdminMiddleware");
 
 const router = express.Router();
 
-// Every license-management endpoint is restricted to authenticated platform admins.
 router.use(authenticatePlatformAdmin);
 
-router.get("/", getLicenses);
-router.get("/:licenseId", getLicenseById);
-router.post("/", createLicense);
-router.post("/:licenseId/renew", renewLicense);
-router.patch("/:licenseId/status", updateLicenseStatus);
+router.get(
+  "/",
+  requirePlatformPermission("licenses.view"),
+  getLicenses
+);
+
+router.get(
+  "/:licenseId",
+  requirePlatformPermission("licenses.view"),
+  getLicenseById
+);
+
+router.post(
+  "/",
+  requirePlatformPermission("licenses.create"),
+  createLicense
+);
+
+router.post(
+  "/:licenseId/renew",
+  requirePlatformPermission("licenses.renew"),
+  renewLicense
+);
+
+// Select permission according to requested status.
+router.patch(
+  "/:licenseId/status",
+  requirePlatformPermission((req) =>
+    req.body?.status === "active"
+      ? "licenses.activate"
+      : "licenses.suspend"
+  ),
+  updateLicenseStatus
+);
 
 module.exports = router;

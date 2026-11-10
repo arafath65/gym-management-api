@@ -1,3 +1,4 @@
+﻿
 const express = require("express");
 
 const {
@@ -10,26 +11,31 @@ const {
 
 const {
   authenticatePlatformAdmin,
+  requirePlatformPermission,
 } = require("../middleware/platformAdminMiddleware");
 
-const { getPlatformAuditLogs } = require("../controllers/platformAuditController");
+const {
+  getPlatformAuditLogs,
+} = require("../controllers/platformAuditController");
 
 const router = express.Router();
 
-// Public login
+// Public login.
 router.post("/login", loginPlatformAdmin);
 
-// Protected dashboard statistics
+// All routes below require Platform Admin authentication.
+router.use(authenticatePlatformAdmin);
+
 router.get(
   "/dashboard-stats",
-  authenticatePlatformAdmin,
+  requirePlatformPermission("dashboard.view"),
   getPlatformDashboardStats
 );
 
-// Protected, read-only platform audit history.
 router.get(
   "/audit-logs",
-  authenticatePlatformAdmin,
+  requirePlatformPermission("audit_logs.view"),
   getPlatformAuditLogs
 );
+
 module.exports = router;

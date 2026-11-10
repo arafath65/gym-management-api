@@ -1,4 +1,5 @@
-﻿const express = require("express");
+﻿
+const express = require("express");
 
 const {
   activateDevice,
@@ -17,39 +18,43 @@ const {
 
 const {
   authenticatePlatformAdmin,
+  requirePlatformPermission,
 } = require("../middleware/platformAdminMiddleware");
 
 const router = express.Router();
 
-// Gym application device activation (existing endpoint).
+// Gym App device activation.
+// This is not a Platform Admin operation.
 router.post(
   "/activate",
   checkOrganizationLicense,
   activateDevice
 );
 
-// Protected Super Admin device management.
+// All device management operations below require Platform Admin.
+router.use(authenticatePlatformAdmin);
+
 router.get(
   "/",
-  authenticatePlatformAdmin,
+  requirePlatformPermission("devices.view"),
   getDevices
 );
 
 router.post(
   "/register",
-  authenticatePlatformAdmin,
+  requirePlatformPermission("devices.register"),
   registerDevice
 );
 
 router.post(
   "/:deviceId/activation-code",
-  authenticatePlatformAdmin,
+  requirePlatformPermission("devices.activation_code.regenerate"),
   regenerateDeviceActivationCode
 );
 
 router.patch(
   "/:deviceId/revoke",
-  authenticatePlatformAdmin,
+  requirePlatformPermission("devices.revoke"),
   revokeDevice
 );
 
