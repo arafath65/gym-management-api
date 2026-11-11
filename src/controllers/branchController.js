@@ -1,4 +1,4 @@
-﻿const db = require("../config/db");
+const db = require("../config/db");
 const {
   writePlatformAuditLog,
 } = require("../services/platformAuditService");
@@ -180,6 +180,36 @@ const createBranch = async (req, res) => {
 
     const branchId = result.insertId;
 
+    // Automatically grant the initial organization-scoped Gym Admin role
+    // access to this branch. This is part of the same transaction as branch
+    // creation, so the branch cannot be created without its access grant when
+    // an eligible Gym Admin exists.
+    const [gymAdminUsers] = await connection.query(
+      `SELECT DISTINCT u.id
+       FROM users u
+       INNER JOIN user_roles ur
+         ON ur.organization_id = u.organization_id
+        AND ur.user_id = u.id
+       INNER JOIN roles r
+         ON r.organization_id = ur.organization_id
+        AND r.id = ur.role_id
+       WHERE u.organization_id = ?
+         AND u.status = 'active'
+         AND r.name = 'Gym Admin'
+         AND r.is_system_role = 1
+       ORDER BY u.id`,
+      [organizationId]
+    );
+
+    for (const gymAdmin of gymAdminUsers) {
+      await connection.query(
+        `INSERT INTO user_branch_access
+         (organization_id, user_id, branch_id)
+         VALUES (?, ?, ?)`,
+        [organizationId, gymAdmin.id, branchId]
+      );
+    }
+
     const [created] = await connection.query(
       `SELECT id, organization_id, name, branch_code,
               phone, address, status, created_at
@@ -210,6 +240,24 @@ const createBranch = async (req, res) => {
       userAgent: req.get("user-agent") || null,
     });
 
+    if (gymAdminUsers.length > 0) {
+      await writePlatformAuditLog(connection, {
+        platformAdminId: req.platformAdmin.id,
+        organizationId,
+        action: "GYM_ADMIN_BRANCH_ACCESS_GRANTED",
+        entityType: "branch",
+        entityId: branchId,
+        description: `Automatically granted the new branch to ${gymAdminUsers.length} active Gym Admin account(s)`,
+        oldValues: null,
+        newValues: {
+          branch_id: branchId,
+          user_ids: gymAdminUsers.map((user) => user.id),
+          access_source: "system_gym_admin_role",
+        },
+        ipAddress: req.ip || null,
+        userAgent: req.get("user-agent") || null,
+      });
+    }
     await connection.commit();
     transactionStarted = false;
 

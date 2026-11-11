@@ -1,4 +1,5 @@
 const crypto = require("crypto");
+const bcrypt = require("bcrypt");
 const db = require("../config/db");
 
 const {
@@ -73,6 +74,9 @@ const createOrganization = async (req, res) => {
       trialDays = 14,
       maxDevices = 2,
       expiresAt,
+      adminName,
+      adminUsername,
+      adminPassword,
       notes,
     } = req.body || {};
 
@@ -88,6 +92,49 @@ const createOrganization = async (req, res) => {
       });
     }
 
+    if (
+      typeof adminName !== "string" ||
+      !adminName.trim() ||
+      adminName.trim().length > 150
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Gym Admin name is required and must not exceed 150 characters",
+      });
+    }
+
+    if (
+      typeof adminUsername !== "string" ||
+      !adminUsername.trim() ||
+      adminUsername.trim().length > 150
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Gym Admin username/email is required",
+      });
+    }
+
+    const normalizedAdminUsername = adminUsername.trim().toLowerCase();
+
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(normalizedAdminUsername)) {
+      return res.status(400).json({
+        success: false,
+        message: "Gym Admin username must be a valid email address",
+      });
+    }
+
+    if (
+      typeof adminPassword !== "string" ||
+      adminPassword.length < 8 ||
+      Buffer.byteLength(adminPassword, "utf8") > 72
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Gym Admin password must be at least 8 characters and no more than 72 UTF-8 bytes",
+      });
+    }
+
+    const normalizedAdminName = adminName.trim();
     const normalizedName = name.trim();
     const normalizedSlug = slug.trim().toLowerCase();
 
@@ -179,6 +226,8 @@ const createOrganization = async (req, res) => {
       });
     }
 
+    const adminPasswordHash = await bcrypt.hash(adminPassword, 12);
+
     connection = await db.getConnection();
     await connection.beginTransaction();
     transactionStarted = true;
@@ -265,6 +314,98 @@ const createOrganization = async (req, res) => {
     );
 
     const createdLicense = createdLicenses[0];
+    // ------------------------------------------------
+    // CREATE INITIAL GYM ADMIN USER
+    // ------------------------------------------------
+    const [gymAdminUserResult] = await connection.query(
+      `INSERT INTO users
+       (organization_id, full_name, email, phone, password_hash, status)
+       VALUES (?, ?, ?, NULL, ?, 'active')`,
+      [
+        organizationId,
+        normalizedAdminName,
+        normalizedAdminUsername,
+        adminPasswordHash,
+      ]
+    );
+
+    const gymAdminUserId = gymAdminUserResult.insertId;
+
+    // ------------------------------------------------
+    // CREATE ORGANIZATION-SCOPED SYSTEM GYM ADMIN ROLE
+    // ------------------------------------------------
+    const [gymAdminRoleResult] = await connection.query(
+      `INSERT INTO roles
+       (organization_id, name, description, is_system_role)
+       VALUES (?, 'Gym Admin', ?, 1)`,
+      [
+        organizationId,
+        "Initial organization administrator with gym management permissions",
+      ]
+    );
+
+    const gymAdminRoleId = gymAdminRoleResult.insertId;
+
+    // These are tenant-level Gym Staff permissions only.
+    // Platform organization and license administration permissions are excluded.
+    // Branch deletion is excluded; branch deactivation is handled separately.
+    const gymAdminPermissionKeys = [
+      "branches.view",
+      "branches.create",
+      "branches.update",
+      "users.view",
+      "users.create",
+      "users.update",
+      "users.deactivate",
+      "roles.view",
+      "roles.create",
+      "roles.update",
+      "roles.assign",
+      "audit_logs.view",
+      "licenses.view",
+    ];
+
+    const permissionPlaceholders = gymAdminPermissionKeys
+      .map(() => "?")
+      .join(", ");
+
+    const [gymAdminPermissions] = await connection.query(
+      `SELECT id, permission_key
+       FROM permissions
+       WHERE permission_key IN (${permissionPlaceholders})`,
+      gymAdminPermissionKeys
+    );
+
+    const permissionMap = new Map(
+      gymAdminPermissions.map((permission) => [
+        permission.permission_key,
+        permission.id,
+      ])
+    );
+
+    const missingPermissions = gymAdminPermissionKeys.filter(
+      (permissionKey) => !permissionMap.has(permissionKey)
+    );
+
+    if (missingPermissions.length > 0) {
+      throw new Error(
+        `Missing Gym Admin permissions: ${missingPermissions.join(", ")}`
+      );
+    }
+
+    for (const permissionKey of gymAdminPermissionKeys) {
+      await connection.query(
+        `INSERT INTO role_permissions (role_id, permission_id)
+         VALUES (?, ?)`,
+        [gymAdminRoleId, permissionMap.get(permissionKey)]
+      );
+    }
+
+    await connection.query(
+      `INSERT INTO user_roles (organization_id, user_id, role_id)
+       VALUES (?, ?, ?)`,
+      [organizationId, gymAdminUserId, gymAdminRoleId]
+    );
 
     await writePlatformAuditLog(connection, {
       platformAdminId: adminId,
@@ -290,13 +431,45 @@ const createOrganization = async (req, res) => {
       ipAddress: req.ip || null,
       userAgent: req.get("user-agent") || null,
     });
+    await writePlatformAuditLog(connection, {
+      platformAdminId: adminId,
+      organizationId,
+      action: "GYM_ADMIN_CREATED",
+      entityType: "user",
+      entityId: gymAdminUserId,
+      description: `Created initial Gym Admin account ${normalizedAdminUsername}`,
+      newValues: {
+        user_id: gymAdminUserId,
+        full_name: normalizedAdminName,
+        email: normalizedAdminUsername,
+        role: "Gym Admin",
+      },
+      ipAddress: req.ip || null,
+      userAgent: req.get("user-agent") || null,
+    });
 
+    await writePlatformAuditLog(connection, {
+      platformAdminId: adminId,
+      organizationId,
+      action: "GYM_ADMIN_ROLE_ASSIGNED",
+      entityType: "role",
+      entityId: gymAdminRoleId,
+      description: `Assigned initial Gym Admin role to ${normalizedAdminUsername}`,
+      newValues: {
+        role_id: gymAdminRoleId,
+        role_name: "Gym Admin",
+        user_id: gymAdminUserId,
+        permission_keys: gymAdminPermissionKeys,
+      },
+      ipAddress: req.ip || null,
+      userAgent: req.get("user-agent") || null,
+    });
     await connection.commit();
     transactionStarted = false;
 
     return res.status(201).json({
       success: true,
-      message: "Organization and license created successfully",
+      message: "Organization, license and initial Gym Admin created successfully",
       organization: {
         id: organizationId,
         name: normalizedName,
@@ -308,6 +481,13 @@ const createOrganization = async (req, res) => {
         status: "active",
       },
       license: createdLicense,
+      gymAdmin: {
+        id: gymAdminUserId,
+        full_name: normalizedAdminName,
+        email: normalizedAdminUsername,
+        role: "Gym Admin",
+        status: "active",
+      },
     });
   } catch (error) {
     if (connection && transactionStarted) {
@@ -318,7 +498,7 @@ const createOrganization = async (req, res) => {
 
     return res.status(500).json({
       success: false,
-      message: "Failed to create organization and license",
+      message: "Failed to create organization, license and initial Gym Admin",
     });
   } finally {
     if (connection) connection.release();
@@ -421,6 +601,30 @@ const updateOrganization = async (req, res) => {
       });
     }
 
+    const gymOwnerFieldsProvided =
+      Object.prototype.hasOwnProperty.call(body, "gymOwnerName") ||
+      Object.prototype.hasOwnProperty.call(body, "gymOwnerUsername");
+    const normalizedGymOwnerName =
+      typeof body.gymOwnerName === "string" ? body.gymOwnerName.trim() : "";
+    const normalizedGymOwnerUsername =
+      typeof body.gymOwnerUsername === "string"
+        ? body.gymOwnerUsername.trim().toLowerCase()
+        : "";
+
+    if (gymOwnerFieldsProvided) {
+      if (
+        !normalizedGymOwnerName ||
+        normalizedGymOwnerName.length > 150 ||
+        !normalizedGymOwnerUsername ||
+        normalizedGymOwnerUsername.length > 150 ||
+        !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(normalizedGymOwnerUsername)
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Gym Owner name and a valid login email are required",
+        });
+      }
+    }
     // License changes are optional. An organization can exist without a license.
     const licenseFieldsProvided = [
       "licenseType",
@@ -700,6 +904,93 @@ const updateOrganization = async (req, res) => {
       }
     }
 
+    let updatedGymOwner = null;
+
+    if (gymOwnerFieldsProvided) {
+      const [gymOwners] = await connection.query(
+        `SELECT u.id, u.full_name, u.email
+         FROM users u
+         INNER JOIN user_roles ur
+           ON ur.organization_id = u.organization_id
+          AND ur.user_id = u.id
+         INNER JOIN roles r
+           ON r.organization_id = ur.organization_id
+          AND r.id = ur.role_id
+         WHERE u.organization_id = ?
+           AND r.name = 'Gym Admin'
+           AND r.is_system_role = 1
+         ORDER BY u.id ASC
+         LIMIT 1
+         FOR UPDATE`,
+        [organizationId]
+      );
+
+      if (gymOwners.length === 0) {
+        await connection.rollback();
+        transactionStarted = false;
+        return res.status(404).json({
+          success: false,
+          message: "Gym Owner account not found for this organization",
+        });
+      }
+
+      const oldGymOwner = gymOwners[0];
+      const [duplicateUsernames] = await connection.query(
+        `SELECT id
+         FROM users
+         WHERE organization_id = ?
+           AND email = ?
+           AND id <> ?
+         LIMIT 1`,
+        [organizationId, normalizedGymOwnerUsername, oldGymOwner.id]
+      );
+
+      if (duplicateUsernames.length > 0) {
+        await connection.rollback();
+        transactionStarted = false;
+        return res.status(409).json({
+          success: false,
+          message: "This login username is already used by another user in this organization",
+        });
+      }
+
+      await connection.query(
+        `UPDATE users
+         SET full_name = ?, email = ?, updated_at = NOW()
+         WHERE id = ? AND organization_id = ?`,
+        [
+          normalizedGymOwnerName,
+          normalizedGymOwnerUsername,
+          oldGymOwner.id,
+          organizationId,
+        ]
+      );
+
+      updatedGymOwner = {
+        id: oldGymOwner.id,
+        full_name: normalizedGymOwnerName,
+        email: normalizedGymOwnerUsername,
+      };
+
+      await writePlatformAuditLog(connection, {
+        platformAdminId: req.platformAdmin?.id,
+        organizationId,
+        action: "GYM_ADMIN_ACCOUNT_UPDATED",
+        entityType: "user",
+        entityId: oldGymOwner.id,
+        description: `Updated Gym Owner account ${normalizedGymOwnerUsername}`,
+        oldValues: {
+          full_name: oldGymOwner.full_name,
+          email: oldGymOwner.email,
+        },
+        newValues: {
+          full_name: normalizedGymOwnerName,
+          email: normalizedGymOwnerUsername,
+        },
+        ipAddress: req.ip || null,
+        userAgent: req.get("user-agent") || null,
+      });
+    }
     await writePlatformAuditLog(connection, {
       platformAdminId: req.platformAdmin?.id,
       organizationId,
@@ -741,6 +1032,7 @@ const updateOrganization = async (req, res) => {
         address: address?.trim() || null,
       },
       license: updatedLicense,
+      gymOwner: updatedGymOwner,
     });
   } catch (error) {
     if (connection && transactionStarted) {
@@ -876,7 +1168,154 @@ const setOrganizationStatus = async (req, res) => {
   }
 };
 
+const getOrganizationGymOwner = async (req, res) => {
+  try {
+    const organizationId = Number(req.params.organizationId);
+    if (!Number.isSafeInteger(organizationId) || organizationId <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid organization ID",
+      });
+    }
+
+    const [owners] = await db.query(
+      `SELECT u.id, u.full_name, u.email
+       FROM users u
+       INNER JOIN user_roles ur
+         ON ur.organization_id = u.organization_id AND ur.user_id = u.id
+       INNER JOIN roles r
+         ON r.organization_id = ur.organization_id AND r.id = ur.role_id
+       WHERE u.organization_id = ?
+         AND r.name = 'Gym Admin'
+         AND r.is_system_role = 1
+       ORDER BY u.id ASC
+       LIMIT 1`,
+      [organizationId]
+    );
+
+    return res.json({
+      success: true,
+      gymOwner: owners[0] || null,
+    });
+  } catch (error) {
+    console.error("Get organization Gym Owner error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to retrieve Gym Owner account",
+    });
+  }
+};
+
+const resetOrganizationGymOwnerPassword = async (req, res) => {
+  let connection;
+  let transactionStarted = false;
+
+  try {
+    const organizationId = Number(req.params.organizationId);
+    const { newPassword } = req.body || {};
+
+    if (!Number.isSafeInteger(organizationId) || organizationId <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid organization ID",
+      });
+    }
+
+    if (
+      typeof newPassword !== "string" ||
+      newPassword.length < 8 ||
+      Buffer.byteLength(newPassword, "utf8") > 72
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "New password must be at least 8 characters and no more than 72 UTF-8 bytes",
+      });
+    }
+
+    connection = await db.getConnection();
+    await connection.beginTransaction();
+    transactionStarted = true;
+
+    const [owners] = await connection.query(
+      `SELECT u.id, u.email
+       FROM users u
+       INNER JOIN user_roles ur
+         ON ur.organization_id = u.organization_id AND ur.user_id = u.id
+       INNER JOIN roles r
+         ON r.organization_id = ur.organization_id AND r.id = ur.role_id
+       WHERE u.organization_id = ?
+         AND r.name = 'Gym Admin'
+         AND r.is_system_role = 1
+       ORDER BY u.id ASC
+       LIMIT 1
+       FOR UPDATE`,
+      [organizationId]
+    );
+
+    if (owners.length === 0) {
+      await connection.rollback();
+      transactionStarted = false;
+      return res.status(404).json({
+        success: false,
+        message: "Gym Owner account not found for this organization",
+      });
+    }
+
+    const owner = owners[0];
+    const passwordHash = await bcrypt.hash(newPassword, 12);
+
+    await connection.query(
+      `UPDATE users
+       SET password_hash = ?, updated_at = NOW()
+       WHERE id = ? AND organization_id = ?`,
+      [passwordHash, owner.id, organizationId]
+    );
+
+    await writePlatformAuditLog(connection, {
+      platformAdminId: req.platformAdmin?.id,
+      organizationId,
+      action: "GYM_ADMIN_PASSWORD_RESET",
+      entityType: "user",
+      entityId: owner.id,
+      description: `Reset password for Gym Owner account ${owner.email}`,
+      oldValues: null,
+      newValues: {
+        user_id: owner.id,
+        email: owner.email,
+        reset_by_platform_admin_id: req.platformAdmin?.id || null,
+      },
+      ipAddress: req.ip || null,
+      userAgent: req.get("user-agent") || null,
+    });
+
+    await connection.commit();
+    transactionStarted = false;
+
+    return res.json({
+      success: true,
+      message: "Gym Owner password reset successfully",
+    });
+  } catch (error) {
+    if (connection && transactionStarted) {
+      try {
+        await connection.rollback();
+      } catch (rollbackError) {
+        console.error("Gym Owner password reset rollback error:", rollbackError);
+      }
+    }
+
+    console.error("Reset organization Gym Owner password error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to reset Gym Owner password",
+    });
+  } finally {
+    if (connection) connection.release();
+  }
+};
 module.exports = {
+  getOrganizationGymOwner,
+  resetOrganizationGymOwnerPassword,
   createOrganization,
   getOrganizations,
   updateOrganization,

@@ -1,7 +1,9 @@
-﻿
+
 const express = require("express");
 
 const {
+  getOrganizationGymOwner,
+  resetOrganizationGymOwnerPassword,
   createOrganization,
   getOrganizations,
   updateOrganization,
@@ -29,6 +31,17 @@ router.post(
   createOrganization
 );
 
+router.get(
+  "/:organizationId/gym-owner",
+  requirePlatformPermission("organizations.view"),
+  getOrganizationGymOwner
+);
+
+router.patch(
+  "/:organizationId/gym-owner/reset-password",
+  requirePlatformPermission("organizations.update"),
+  resetOrganizationGymOwnerPassword
+);
 router.put(
   "/:organizationId",
   requirePlatformPermission("organizations.update"),
