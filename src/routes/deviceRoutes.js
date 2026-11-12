@@ -1,9 +1,13 @@
-﻿
+
 const express = require("express");
 
 const {
   activateDevice,
 } = require("../controllers/deviceController");
+
+const {
+  authenticateDevice,
+} = require("../middleware/deviceAuthMiddleware");
 
 const {
   getDevices,
@@ -12,9 +16,6 @@ const {
   revokeDevice,
 } = require("../controllers/deviceManagementController");
 
-const {
-  checkOrganizationLicense,
-} = require("../middleware/licenseMiddleware");
 
 const {
   authenticatePlatformAdmin,
@@ -27,9 +28,28 @@ const router = express.Router();
 // This is not a Platform Admin operation.
 router.post(
   "/activate",
-  checkOrganizationLicense,
   activateDevice
 );
+
+// Validate an already activated Gym App device at app startup.
+// This route uses the device token, not Platform Admin authentication.
+router.get("/validate", authenticateDevice, (req, res) => {
+  return res.json({
+    success: true,
+    message: "Device is valid",
+    organization: {
+      id: req.device.organizationId,
+      name: req.device.organizationName,
+    },
+    device: {
+      id: req.device.id,
+      organization_id: req.device.organizationId,
+      device_uuid: req.device.deviceUuid,
+      device_name: req.device.deviceName,
+      status: req.device.status,
+    },
+  });
+});
 
 // All device management operations below require Platform Admin.
 router.use(authenticatePlatformAdmin);

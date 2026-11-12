@@ -10,34 +10,55 @@ const activateDevice = async (req, res) => {
   let transactionStarted = false;
 
   try {
-    const { organization_id, device_uuid, activation_code } = req.body || {};
+    const { device_uuid, activation_code } = req.body || {};
 
-    if (!organization_id || !device_uuid || !activation_code) {
+    if (
+      typeof device_uuid !== "string" ||
+      typeof activation_code !== "string" ||
+      !device_uuid.trim() ||
+      !activation_code.trim()
+    ) {
       return res.status(400).json({
         success: false,
-        message:
-          "Organization ID, device UUID, and activation code are required",
+        message: "Device UUID and activation code are required",
       });
     }
 
-    const orgId = Number(organization_id);
     const deviceUuid = device_uuid.trim();
     const activationCode = activation_code.trim();
-
-    if (!Number.isInteger(orgId) || orgId <= 0) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid organization ID",
-      });
-    }
 
     connection = await db.getConnection();
     await connection.beginTransaction();
     transactionStarted = true;
+
+    const activationHash = hashValue(activationCode);
+
+    const [matchedDevices] = await connection.query(
+      `SELECT id, organization_id
+       FROM devices
+       WHERE device_uuid = ?
+         AND activation_code_hash = ?
+         AND status = 'pending'
+       LIMIT 1`,
+      [deviceUuid, activationHash]
+    );
+
+    if (matchedDevices.length === 0) {
+      await connection.rollback();
+      transactionStarted = false;
+
+      return res.status(401).json({
+        success: false,
+        message: "Invalid activation code or device",
+      });
+    }
+
+    const orgId = matchedDevices[0].organization_id;
+
     // Lock and verify the organization before checking its license.
     // This serializes activation against organization deactivation.
     const [organizations] = await connection.query(
-      `SELECT id, status
+      `SELECT id, name, status
        FROM organizations
        WHERE id = ?
        LIMIT 1
@@ -152,8 +173,6 @@ const activateDevice = async (req, res) => {
       });
     }
 
-    const activationHash = hashValue(activationCode);
-
     const [devices] = await connection.query(
       `SELECT id, organization_id, device_uuid, status,
               activation_expires_at
@@ -232,6 +251,10 @@ const activateDevice = async (req, res) => {
     return res.json({
       success: true,
       message: "Device activated successfully",
+      organization: {
+        id: organizations[0].id,
+        name: organizations[0].name,
+      },
       device: {
         id: device.id,
         organization_id: device.organization_id,

@@ -533,7 +533,7 @@ const registerDevice = async (req, res) => {
          activation_code_hash,
          activation_expires_at
        )
-       VALUES (?, ?, ?, ?, ?, 'pending', ?, DATE_ADD(NOW(), INTERVAL 24 HOUR))`,
+       VALUES (?, ?, ?, ?, ?, 'pending', ?, DATE_ADD(NOW(), INTERVAL 15 MINUTE))`,
       [
         organizationId,
         branchId,
@@ -709,7 +709,7 @@ const regenerateDeviceActivationCode = async (req, res) => {
        SET status = 'pending',
            activation_code_hash = ?,
            device_token_hash = NULL,
-           activation_expires_at = DATE_ADD(NOW(), INTERVAL 24 HOUR)
+           activation_expires_at = DATE_ADD(NOW(), INTERVAL 15 MINUTE)
        WHERE id = ?`,
       [activationHash, deviceId]
     );
