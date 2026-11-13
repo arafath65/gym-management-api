@@ -3,6 +3,7 @@ const express = require("express");
 
 const {
   getOrganizationGymOwner,
+  provisionLegacyOrganizationGymOwner,
   resetOrganizationGymOwnerPassword,
   createOrganization,
   getOrganizations,
@@ -35,6 +36,12 @@ router.get(
   "/:organizationId/gym-owner",
   requirePlatformPermission("organizations.view"),
   getOrganizationGymOwner
+);
+
+router.post(
+  "/:organizationId/gym-owner/provision",
+  requirePlatformPermission("organizations.update"),
+  provisionLegacyOrganizationGymOwner
 );
 
 router.patch(

@@ -5,17 +5,41 @@ const hashValue = (value) =>
   crypto.createHash("sha256").update(value).digest("hex");
 
 const authenticateDevice = async (req, res, next) => {
+  // Device token has its own header so Gym Staff JWT can use Authorization.
+  const deviceTokenHeader = req.headers["x-device-token"];
   const authorization = req.headers.authorization;
 
-  if (!authorization || !authorization.startsWith("Bearer ")) {
+  let token = null;
+
+  if (deviceTokenHeader !== undefined) {
+    if (
+      typeof deviceTokenHeader !== "string" ||
+      !deviceTokenHeader.trim()
+    ) {
+      return res.status(401).json({
+        success: false,
+        code: "DEVICE_TOKEN_REQUIRED",
+        message: "A valid device authentication token is required",
+      });
+    }
+
+    token = deviceTokenHeader.trim();
+
+  } else if (
+    typeof authorization === "string" &&
+    authorization.startsWith("Bearer ")
+  ) {
+    // Backward compatibility for device activation/validation clients.
+    token = authorization.slice(7).trim();
+  }
+
+  if (!token) {
     return res.status(401).json({
       success: false,
       code: "DEVICE_TOKEN_REQUIRED",
       message: "Device authentication token is required",
     });
   }
-
-  const token = authorization.slice(7).trim();
 
   // Device tokens are generated as 32 random bytes encoded as hex.
   if (!/^[a-f0-9]{64}$/i.test(token)) {
@@ -35,6 +59,7 @@ const authenticateDevice = async (req, res, next) => {
          d.organization_id,
          d.device_uuid,
          d.device_name,
+         d.registered_branch_id,
          d.status AS device_status,
 
          o.name AS organization_name,
@@ -136,6 +161,10 @@ const authenticateDevice = async (req, res, next) => {
       organizationName: row.organization_name,
       deviceUuid: row.device_uuid,
       deviceName: row.device_name,
+      registeredBranchId:
+        row.registered_branch_id == null
+          ? null
+          : Number(row.registered_branch_id),
       status: row.device_status,
     };
 

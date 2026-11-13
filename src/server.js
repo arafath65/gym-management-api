@@ -9,6 +9,7 @@ const deviceRoutes = require("./routes/deviceRoutes");
 
 const platformAdminRoutes = require("./routes/platformAdminRoutes");
 const licenseRoutes = require("./routes/licenseRoutes");
+const gymAuthRoutes = require("./routes/gymAuthRoutes");
 
 const app = express();
 
@@ -20,6 +21,7 @@ app.use("/api/devices", deviceRoutes);
 
 app.use("/api/platform-admin", platformAdminRoutes);
 app.use("/api/licenses", licenseRoutes);
+app.use("/api/gym-auth", gymAuthRoutes);
 
 
 app.get("/", (req, res) => {

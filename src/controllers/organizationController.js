@@ -5,6 +5,9 @@ const db = require("../config/db");
 const {
   writePlatformAuditLog,
 } = require("../services/platformAuditService");
+const {
+  syncGymAdminRolePermissions,
+} = require("../services/gymAdminPermissionService");
 
 const generateOrganizationCode = () => {
   const randomCode = crypto.randomBytes(3).toString("hex").toUpperCase();
@@ -346,61 +349,16 @@ const createOrganization = async (req, res) => {
 
     const gymAdminRoleId = gymAdminRoleResult.insertId;
 
-    // These are tenant-level Gym Staff permissions only.
-    // Platform organization and license administration permissions are excluded.
-    // Branch deletion is excluded; branch deactivation is handled separately.
-    const gymAdminPermissionKeys = [
-      "branches.view",
-      "branches.create",
-      "branches.update",
-      "users.view",
-      "users.create",
-      "users.update",
-      "users.deactivate",
-      "roles.view",
-      "roles.create",
-      "roles.update",
-      "roles.assign",
-      "audit_logs.view",
-      "licenses.view",
-    ];
-
-    const permissionPlaceholders = gymAdminPermissionKeys
-      .map(() => "?")
-      .join(", ");
-
-    const [gymAdminPermissions] = await connection.query(
-      `SELECT id, permission_key
-       FROM permissions
-       WHERE permission_key IN (${permissionPlaceholders})`,
-      gymAdminPermissionKeys
+    // ------------------------------------------------
+    // SYNCHRONIZE GYM ADMIN DEFAULT PERMISSIONS
+    // ------------------------------------------------
+    const gymAdminPermissionSync = await syncGymAdminRolePermissions(
+      connection,
+      {
+        organizationId,
+        roleId: gymAdminRoleId,
+      }
     );
-
-    const permissionMap = new Map(
-      gymAdminPermissions.map((permission) => [
-        permission.permission_key,
-        permission.id,
-      ])
-    );
-
-    const missingPermissions = gymAdminPermissionKeys.filter(
-      (permissionKey) => !permissionMap.has(permissionKey)
-    );
-
-    if (missingPermissions.length > 0) {
-      throw new Error(
-        `Missing Gym Admin permissions: ${missingPermissions.join(", ")}`
-      );
-    }
-
-    for (const permissionKey of gymAdminPermissionKeys) {
-      await connection.query(
-        `INSERT INTO role_permissions (role_id, permission_id)
-         VALUES (?, ?)`,
-        [gymAdminRoleId, permissionMap.get(permissionKey)]
-      );
-    }
-
     await connection.query(
       `INSERT INTO user_roles (organization_id, user_id, role_id)
        VALUES (?, ?, ?)`,
@@ -459,7 +417,8 @@ const createOrganization = async (req, res) => {
         role_id: gymAdminRoleId,
         role_name: "Gym Admin",
         user_id: gymAdminUserId,
-        permission_keys: gymAdminPermissionKeys,
+        permission_keys: gymAdminPermissionSync.permissionKeys,
+        permission_count: gymAdminPermissionSync.permissionCount,
       },
       ipAddress: req.ip || null,
       userAgent: req.get("user-agent") || null,
@@ -1168,6 +1127,459 @@ const setOrganizationStatus = async (req, res) => {
   }
 };
 
+const provisionLegacyOrganizationGymOwner = async (req, res) => {
+  let connection;
+  let transactionStarted = false;
+
+  try {
+    const organizationId = Number(req.params.organizationId);
+
+    const {
+      fullName,
+      email,
+      password,
+      phone = null,
+    } = req.body || {};
+
+    // ------------------------------------------------
+    // VALIDATE ORGANIZATION ID
+    // ------------------------------------------------
+
+    if (
+      !Number.isSafeInteger(organizationId) ||
+      organizationId <= 0
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid organization ID",
+      });
+    }
+
+    // ------------------------------------------------
+    // VALIDATE GYM OWNER NAME
+    // ------------------------------------------------
+
+    if (
+      typeof fullName !== "string" ||
+      !fullName.trim() ||
+      fullName.trim().length > 150
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Gym Owner name is required and must not exceed 150 characters",
+      });
+    }
+
+    // ------------------------------------------------
+    // VALIDATE EMAIL
+    // ------------------------------------------------
+
+    if (
+      typeof email !== "string" ||
+      !email.trim() ||
+      email.trim().length > 150
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Gym Owner email is required",
+      });
+    }
+
+    const normalizedEmail = email.trim().toLowerCase();
+
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(normalizedEmail)) {
+      return res.status(400).json({
+        success: false,
+        message: "Gym Owner email must be a valid email address",
+      });
+    }
+
+    // ------------------------------------------------
+    // VALIDATE PASSWORD
+    // ------------------------------------------------
+
+    if (
+      typeof password !== "string" ||
+      password.length < 8 ||
+      Buffer.byteLength(password, "utf8") > 72
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Gym Owner password must be at least 8 characters and no more than 72 UTF-8 bytes",
+      });
+    }
+
+    // ------------------------------------------------
+    // VALIDATE OPTIONAL PHONE
+    // ------------------------------------------------
+
+    if (
+      phone !== null &&
+      phone !== undefined &&
+      (
+        typeof phone !== "string" ||
+        phone.trim().length > 30
+      )
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Phone number must not exceed 30 characters",
+      });
+    }
+
+    const normalizedName = fullName.trim();
+    const normalizedPhone =
+      typeof phone === "string" && phone.trim()
+        ? phone.trim()
+        : null;
+
+    // ------------------------------------------------
+    // HASH PASSWORD
+    // ------------------------------------------------
+
+    const passwordHash = await bcrypt.hash(password, 12);
+
+    connection = await db.getConnection();
+
+    await connection.beginTransaction();
+    transactionStarted = true;
+
+    // ------------------------------------------------
+    // LOCK AND VERIFY ORGANIZATION
+    // ------------------------------------------------
+
+    const [organizations] = await connection.query(
+      `SELECT id, name, status
+       FROM organizations
+       WHERE id = ?
+       LIMIT 1
+       FOR UPDATE`,
+      [organizationId]
+    );
+
+    const rejectWithRollback = async (statusCode, message) => {
+      if (connection && transactionStarted) {
+        await connection.rollback();
+        transactionStarted = false;
+      }
+
+      return res.status(statusCode).json({
+        success: false,
+        message,
+      });
+    };
+
+    if (organizations.length === 0) {
+      return await rejectWithRollback(
+        404,
+        "Organization not found"
+      );
+    }
+
+    const organization = organizations[0];
+
+    if (organization.status !== "active") {
+      return await rejectWithRollback(
+        409,
+        "Organization must be active before Gym Owner provisioning"
+      );
+    }
+
+    // ------------------------------------------------
+    // PREVENT DUPLICATE OR PARTIAL GYM ADMIN SETUP
+    // ------------------------------------------------
+
+    const [existingRoles] = await connection.query(
+      `SELECT id, name, is_system_role
+       FROM roles
+       WHERE organization_id = ?
+         AND name = 'Gym Admin'
+       LIMIT 1
+       FOR UPDATE`,
+      [organizationId]
+    );
+
+    if (existingRoles.length > 0) {
+      return await rejectWithRollback(
+        409,
+        "A Gym Admin role already exists for this organization. Review the existing setup instead of provisioning a duplicate."
+      );
+    }
+
+    // ------------------------------------------------
+    // PREVENT DUPLICATE EMAIL
+    // ------------------------------------------------
+
+    const [duplicateUsers] = await connection.query(
+      `SELECT id
+       FROM users
+       WHERE organization_id = ?
+         AND email = ?
+       LIMIT 1
+       FOR UPDATE`,
+      [organizationId, normalizedEmail]
+    );
+
+    if (duplicateUsers.length > 0) {
+      return await rejectWithRollback(
+        409,
+        "This email address is already registered in the organization"
+      );
+    }
+
+    // ------------------------------------------------
+    // CREATE GYM OWNER USER
+    // ------------------------------------------------
+
+    const [userResult] = await connection.query(
+      `INSERT INTO users
+       (
+         organization_id,
+         full_name,
+         email,
+         phone,
+         password_hash,
+         status
+       )
+       VALUES (?, ?, ?, ?, ?, 'active')`,
+      [
+        organizationId,
+        normalizedName,
+        normalizedEmail,
+        normalizedPhone,
+        passwordHash,
+      ]
+    );
+
+    const gymAdminUserId = userResult.insertId;
+
+    // ------------------------------------------------
+    // CREATE ORGANIZATION-SCOPED SYSTEM GYM ADMIN ROLE
+    // ------------------------------------------------
+
+    const [roleResult] = await connection.query(
+      `INSERT INTO roles
+       (
+         organization_id,
+         name,
+         description,
+         is_system_role
+       )
+       VALUES (?, 'Gym Admin', ?, 1)`,
+      [
+        organizationId,
+        "Initial organization administrator with gym management permissions",
+      ]
+    );
+
+    const gymAdminRoleId = roleResult.insertId;
+
+    // ------------------------------------------------
+    // SYNCHRONIZE CURRENT DEFAULT GYM ADMIN PERMISSIONS
+    // ------------------------------------------------
+
+    const permissionSync = await syncGymAdminRolePermissions(
+      connection,
+      {
+        organizationId,
+        roleId: gymAdminRoleId,
+      }
+    );
+
+    // ------------------------------------------------
+    // ASSIGN GYM ADMIN ROLE TO USER
+    // ------------------------------------------------
+
+    await connection.query(
+      `INSERT INTO user_roles
+       (organization_id, user_id, role_id)
+       VALUES (?, ?, ?)`,
+      [
+        organizationId,
+        gymAdminUserId,
+        gymAdminRoleId,
+      ]
+    );
+
+    // ------------------------------------------------
+    // LOAD EXISTING ACTIVE BRANCHES
+    // ------------------------------------------------
+
+    const [activeBranches] = await connection.query(
+      `SELECT id
+       FROM branches
+       WHERE organization_id = ?
+         AND status = 'active'
+       ORDER BY id ASC
+       FOR UPDATE`,
+      [organizationId]
+    );
+
+    // ------------------------------------------------
+    // GRANT EXISTING BRANCH ACCESS TO GYM OWNER
+    // ------------------------------------------------
+
+    if (activeBranches.length > 0) {
+      const placeholders = activeBranches
+        .map(() => "(?, ?, ?)")
+        .join(", ");
+
+      const values = activeBranches.flatMap((branch) => [
+        organizationId,
+        gymAdminUserId,
+        branch.id,
+      ]);
+
+      await connection.query(
+        `INSERT INTO user_branch_access
+         (organization_id, user_id, branch_id)
+         VALUES ${placeholders}`,
+        values
+      );
+    }
+
+    // ------------------------------------------------
+    // AUDIT: GYM OWNER CREATED
+    // ------------------------------------------------
+
+    await writePlatformAuditLog(connection, {
+      platformAdminId: req.platformAdmin.id,
+      organizationId,
+      action: "GYM_ADMIN_CREATED",
+      entityType: "user",
+      entityId: gymAdminUserId,
+      description:
+        `Provisioned legacy Gym Owner account ${normalizedEmail} for ${organization.name}`,
+      oldValues: null,
+      newValues: {
+        user_id: gymAdminUserId,
+        full_name: normalizedName,
+        email: normalizedEmail,
+        phone: normalizedPhone,
+        role: "Gym Admin",
+        provisioned_for_existing_organization: true,
+      },
+      ipAddress: req.ip || null,
+      userAgent: req.get("user-agent") || null,
+    });
+
+    // ------------------------------------------------
+    // AUDIT: GYM ADMIN ROLE AND PERMISSIONS
+    // ------------------------------------------------
+
+    await writePlatformAuditLog(connection, {
+      platformAdminId: req.platformAdmin.id,
+      organizationId,
+      action: "GYM_ADMIN_ROLE_ASSIGNED",
+      entityType: "role",
+      entityId: gymAdminRoleId,
+      description:
+        `Assigned system Gym Admin role to ${normalizedEmail}`,
+      oldValues: null,
+      newValues: {
+        role_id: gymAdminRoleId,
+        role_name: "Gym Admin",
+        user_id: gymAdminUserId,
+        permission_keys: permissionSync.permissionKeys,
+        permission_count: permissionSync.permissionCount,
+        provisioned_for_existing_organization: true,
+      },
+      ipAddress: req.ip || null,
+      userAgent: req.get("user-agent") || null,
+    });
+
+    // ------------------------------------------------
+    // AUDIT: EXISTING BRANCH ACCESS
+    // ------------------------------------------------
+
+    if (activeBranches.length > 0) {
+      await writePlatformAuditLog(connection, {
+        platformAdminId: req.platformAdmin.id,
+        organizationId,
+        action: "GYM_ADMIN_BRANCH_ACCESS_GRANTED",
+        entityType: "user",
+        entityId: gymAdminUserId,
+        description:
+          `Granted ${activeBranches.length} existing active branch(es) to the Gym Owner`,
+        oldValues: null,
+        newValues: {
+          user_id: gymAdminUserId,
+          branch_ids: activeBranches.map((branch) => branch.id),
+          branch_count: activeBranches.length,
+          access_source: "legacy_gym_admin_provisioning",
+        },
+        ipAddress: req.ip || null,
+        userAgent: req.get("user-agent") || null,
+      });
+    }
+
+    // ------------------------------------------------
+    // COMMIT
+    // ------------------------------------------------
+
+    await connection.commit();
+    transactionStarted = false;
+
+    return res.status(201).json({
+      success: true,
+      message: "Gym Owner account provisioned successfully",
+      organization: {
+        id: organizationId,
+        name: organization.name,
+      },
+      gymOwner: {
+        id: gymAdminUserId,
+        full_name: normalizedName,
+        email: normalizedEmail,
+        phone: normalizedPhone,
+        role: "Gym Admin",
+        status: "active",
+      },
+      permissions: {
+        count: permissionSync.permissionCount,
+        keys: permissionSync.permissionKeys,
+      },
+      branchAccess: {
+        count: activeBranches.length,
+        branch_ids: activeBranches.map((branch) => branch.id),
+      },
+    });
+
+  } catch (error) {
+    if (connection && transactionStarted) {
+      try {
+        await connection.rollback();
+      } catch (rollbackError) {
+        console.error(
+          "Legacy Gym Owner provisioning rollback failed:",
+          rollbackError.message
+        );
+      }
+
+      transactionStarted = false;
+    }
+
+    if (error.code === "ER_DUP_ENTRY") {
+      return res.status(409).json({
+        success: false,
+        message: "A conflicting Gym Owner account or Gym Admin role already exists",
+      });
+    }
+
+    console.error("Legacy Gym Owner provisioning error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to provision legacy Gym Owner account",
+    });
+
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+};
+
 const getOrganizationGymOwner = async (req, res) => {
   try {
     const organizationId = Number(req.params.organizationId);
@@ -1314,6 +1726,7 @@ const resetOrganizationGymOwnerPassword = async (req, res) => {
   }
 };
 module.exports = {
+  provisionLegacyOrganizationGymOwner,
   getOrganizationGymOwner,
   resetOrganizationGymOwnerPassword,
   createOrganization,
