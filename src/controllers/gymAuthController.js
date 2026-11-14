@@ -274,6 +274,8 @@ const createGymStaffSession = async ({
           registeredBranchId == null
             ? null
             : Number(registeredBranchId),
+        registered_branch_name: req.device.registeredBranchName || null,
+        registered_branch_code: req.device.registeredBranchCode || null,
       },
 
       branch: {
@@ -685,7 +687,15 @@ const switchGymStaffBranch = async (req, res) => {
 const getGymStaffMe = async (req, res) => {
   return res.json({
     success: true,
-    staff: req.gymStaff,
+    staff: {
+      ...req.gymStaff,
+      device: {
+        ...(req.gymStaff?.device || {}),
+        registered_branch_id: req.device?.registeredBranchId ?? null,
+        registered_branch_name: req.device?.registeredBranchName || null,
+        registered_branch_code: req.device?.registeredBranchCode || null,
+      },
+    },
   });
 };
 

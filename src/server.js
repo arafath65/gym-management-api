@@ -10,6 +10,12 @@ const deviceRoutes = require("./routes/deviceRoutes");
 const platformAdminRoutes = require("./routes/platformAdminRoutes");
 const licenseRoutes = require("./routes/licenseRoutes");
 const gymAuthRoutes = require("./routes/gymAuthRoutes");
+const membershipPlanRoutes = require("./routes/membershipPlanRoutes");
+const fitnessProgramRoutes = require("./routes/fitnessProgramRoutes");
+const gymAuditLogRoutes = require('./routes/gymAuditLogRoutes');
+const gymBranchRoutes = require('./routes/gymBranchRoutes');
+const gymDeviceRoutes = require("./routes/gymDeviceRoutes");
+const gymRoleRoutes = require("./routes/gymRoleRoutes");
 
 const app = express();
 
@@ -22,6 +28,12 @@ app.use("/api/devices", deviceRoutes);
 app.use("/api/platform-admin", platformAdminRoutes);
 app.use("/api/licenses", licenseRoutes);
 app.use("/api/gym-auth", gymAuthRoutes);
+app.use("/api/membership-plans", membershipPlanRoutes);
+app.use("/api/fitness-programs", fitnessProgramRoutes);
+app.use('/api/audit-logs', gymAuditLogRoutes);
+app.use('/api/gym-branches', gymBranchRoutes);
+app.use("/api/gym-devices", gymDeviceRoutes);
+app.use("/api/gym-roles", gymRoleRoutes);
 
 
 app.get("/", (req, res) => {

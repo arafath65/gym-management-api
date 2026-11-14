@@ -1,0 +1,27 @@
+{
+  "created_at": "2026-11-14T05:22:57.333Z",
+  "table": "membership_plans",
+  "create_table_sql": "CREATE TABLE `membership_plans` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `organization_id` bigint unsigned NOT NULL,\n  `plan_code` varchar(30) COLLATE utf8mb4_unicode_ci NOT NULL,\n  `name` varchar(120) COLLATE utf8mb4_unicode_ci NOT NULL,\n  `description` text COLLATE utf8mb4_unicode_ci,\n  `package_type` enum('individual','couple') COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT 'individual',\n  `tier` varchar(50) COLLATE utf8mb4_unicode_ci DEFAULT NULL,\n  `duration_value` smallint unsigned NOT NULL,\n  `duration_unit` enum('day','week','month','year') COLLATE utf8mb4_unicode_ci NOT NULL,\n  `price` decimal(12,2) NOT NULL,\n  `currency_code` char(3) COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT 'LKR',\n  `included_members` smallint unsigned NOT NULL DEFAULT '1',\n  `paying_members` smallint unsigned NOT NULL DEFAULT '1',\n  `status` enum('active','inactive') COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT 'active',\n  `created_by_user_id` bigint unsigned NOT NULL,\n  `updated_by_user_id` bigint unsigned DEFAULT NULL,\n  `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,\n  `updated_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,\n  PRIMARY KEY (`id`),\n  UNIQUE KEY `uq_membership_plans_org_code` (`organization_id`,`plan_code`),\n  UNIQUE KEY `uq_membership_plans_org_id` (`organization_id`,`id`),\n  KEY `idx_membership_plans_org_status` (`organization_id`,`status`),\n  KEY `idx_membership_plans_org_created` (`organization_id`,`created_at`),\n  KEY `fk_membership_plans_created_by` (`organization_id`,`created_by_user_id`),\n  KEY `fk_membership_plans_updated_by` (`organization_id`,`updated_by_user_id`),\n  CONSTRAINT `fk_membership_plans_created_by` FOREIGN KEY (`organization_id`, `created_by_user_id`) REFERENCES `users` (`organization_id`, `id`) ON DELETE RESTRICT,\n  CONSTRAINT `fk_membership_plans_organization` FOREIGN KEY (`organization_id`) REFERENCES `organizations` (`id`) ON DELETE RESTRICT,\n  CONSTRAINT `fk_membership_plans_updated_by` FOREIGN KEY (`organization_id`, `updated_by_user_id`) REFERENCES `users` (`organization_id`, `id`) ON DELETE RESTRICT,\n  CONSTRAINT `chk_membership_plans_couple` CHECK (((`package_type` <> _utf8mb4'couple') or ((`included_members` = 2) and (`paying_members` = 1)))),\n  CONSTRAINT `chk_membership_plans_duration` CHECK ((`duration_value` >= 1)),\n  CONSTRAINT `chk_membership_plans_individual` CHECK (((`package_type` <> _utf8mb4'individual') or ((`included_members` = 1) and (`paying_members` = 1)))),\n  CONSTRAINT `chk_membership_plans_member_counts` CHECK (((`included_members` >= `paying_members`) and (`paying_members` >= 1))),\n  CONSTRAINT `chk_membership_plans_price` CHECK ((`price` >= 0))\n) ENGINE=InnoDB AUTO_INCREMENT=2 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+  "rows": [
+    {
+      "id": 1,
+      "organization_id": 3,
+      "plan_code": "MP-000001",
+      "name": "Gold Six months",
+      "description": "Gold 6 months VIP package",
+      "package_type": "individual",
+      "tier": "Gold",
+      "duration_value": 6,
+      "duration_unit": "month",
+      "price": "15000.00",
+      "currency_code": "LKR",
+      "included_members": 1,
+      "paying_members": 1,
+      "status": "active",
+      "created_by_user_id": 3,
+      "updated_by_user_id": null,
+      "created_at": "2026-11-14T04:54:39.000Z",
+      "updated_at": "2026-11-14T04:54:39.000Z"
+    }
+  ]
+}

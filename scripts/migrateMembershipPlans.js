@@ -17,8 +17,13 @@ CREATE TABLE IF NOT EXISTS membership_plans (
 
   tier VARCHAR(50) DEFAULT NULL,
 
-  duration_value SMALLINT UNSIGNED NOT NULL,
-  duration_unit ENUM('day', 'week', 'month', 'year') NOT NULL,
+  validity_type ENUM('fixed', 'ongoing') NOT NULL DEFAULT 'fixed',
+
+  duration_value SMALLINT UNSIGNED NULL,
+  duration_unit ENUM('day', 'week', 'month', 'year') NULL,
+
+  billing_interval_value SMALLINT UNSIGNED NULL,
+  billing_interval_unit ENUM('day', 'week', 'month', 'year') NULL,
 
   price DECIMAL(12,2) NOT NULL,
   currency_code CHAR(3) NOT NULL DEFAULT 'LKR',
@@ -70,6 +75,27 @@ CREATE TABLE IF NOT EXISTS membership_plans (
 
   CONSTRAINT chk_membership_plans_duration
     CHECK (duration_value >= 1),
+
+  CONSTRAINT chk_membership_plans_validity_config
+    CHECK (
+      (
+        validity_type = 'fixed'
+        AND duration_value IS NOT NULL
+        AND duration_value >= 1
+        AND duration_unit IS NOT NULL
+        AND billing_interval_value IS NULL
+        AND billing_interval_unit IS NULL
+      )
+      OR
+      (
+        validity_type = 'ongoing'
+        AND duration_value IS NULL
+        AND duration_unit IS NULL
+        AND billing_interval_value IS NOT NULL
+        AND billing_interval_value >= 1
+        AND billing_interval_unit IS NOT NULL
+      )
+    ),
 
   CONSTRAINT chk_membership_plans_member_counts
     CHECK (

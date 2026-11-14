@@ -60,6 +60,8 @@ const authenticateDevice = async (req, res, next) => {
          d.device_uuid,
          d.device_name,
          d.registered_branch_id,
+         assigned_branch.name AS registered_branch_name,
+         assigned_branch.branch_code AS registered_branch_code,
          d.status AS device_status,
 
          o.name AS organization_name,
@@ -79,6 +81,10 @@ const authenticateDevice = async (req, res, next) => {
          END AS license_not_expired
 
        FROM devices d
+
+       LEFT JOIN branches assigned_branch
+         ON assigned_branch.organization_id = d.organization_id
+        AND assigned_branch.id = d.registered_branch_id
 
        INNER JOIN organizations o
          ON o.id = d.organization_id
@@ -165,6 +171,8 @@ const authenticateDevice = async (req, res, next) => {
         row.registered_branch_id == null
           ? null
           : Number(row.registered_branch_id),
+      registeredBranchName: row.registered_branch_name || null,
+      registeredBranchCode: row.registered_branch_code || null,
       status: row.device_status,
     };
 

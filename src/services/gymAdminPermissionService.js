@@ -44,7 +44,7 @@ const syncGymAdminRolePermissions = async (
   const [defaultPermissions] = await connection.query(
     `SELECT id, permission_key
      FROM permissions
-     WHERE gym_admin_default = 1
+     WHERE permission_scope = 'gym' AND gym_admin_default = 1
      ORDER BY permission_key ASC`
   );
 
