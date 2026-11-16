@@ -436,40 +436,12 @@ const loginGymStaff = async (req, res) => {
       });
     }
 
-    const registeredBranchId =
-      req.device.registeredBranchId == null
-        ? null
-        : Number(req.device.registeredBranchId);
+    // The registered branch is reference metadata only.
+    // Active branch selection is based on this staff member's authorized branches.
 
     let selectedBranchId = null;
 
-    if (registeredBranchId !== null) {
-      if (
-        requestedBranchId !== null &&
-        requestedBranchId !== registeredBranchId
-      ) {
-        return res.status(403).json({
-          success: false,
-          code: "DEVICE_BRANCH_MISMATCH",
-          message: "This device is registered to a different branch",
-        });
-      }
-
-      const hasAccess = branches.some(
-        (branch) => branch.id === registeredBranchId
-      );
-
-      if (!hasAccess) {
-        return res.status(403).json({
-          success: false,
-          code: "DEVICE_BRANCH_ACCESS_DENIED",
-          message: "Your account does not have access to this device's registered branch",
-        });
-      }
-
-      selectedBranchId = registeredBranchId;
-
-    } else if (requestedBranchId !== null) {
+    if (requestedBranchId !== null) {
       const hasAccess = branches.some(
         (branch) => branch.id === requestedBranchId
       );

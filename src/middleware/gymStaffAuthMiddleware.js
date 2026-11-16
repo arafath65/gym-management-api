@@ -146,6 +146,7 @@ const authenticateGymStaff = async (req, res, next) => {
          ON p.id = rp.permission_id
        WHERE ur.organization_id = ?
          AND ur.user_id = ?
+         AND p.permission_scope = 'gym'
        ORDER BY p.permission_key ASC`,
       [organizationId, userId]
     );
