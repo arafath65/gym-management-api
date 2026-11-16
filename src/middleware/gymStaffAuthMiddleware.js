@@ -94,16 +94,32 @@ const authenticateGymStaff = async (req, res, next) => {
 
     const [branchRows] = await db.query(
       `SELECT b.id, b.name, b.branch_code
-       FROM user_branch_access uba
-       INNER JOIN branches b
-         ON b.organization_id = uba.organization_id
-        AND b.id = uba.branch_id
-       WHERE uba.organization_id = ?
-         AND uba.user_id = ?
-         AND uba.branch_id = ?
+       FROM branches b
+       WHERE b.organization_id = ?
+         AND b.id = ?
          AND b.status = 'active'
+         AND (
+           EXISTS (
+             SELECT 1
+             FROM user_roles ur
+             INNER JOIN roles r
+               ON r.organization_id = ur.organization_id
+              AND r.id = ur.role_id
+             WHERE ur.organization_id = b.organization_id
+               AND ur.user_id = ?
+               AND r.name = 'Gym Admin'
+               AND r.is_system_role = 1
+           )
+           OR EXISTS (
+             SELECT 1
+             FROM user_branch_access uba
+             WHERE uba.organization_id = b.organization_id
+               AND uba.user_id = ?
+               AND uba.branch_id = b.id
+           )
+         )
        LIMIT 1`,
-      [organizationId, userId, branchId]
+      [organizationId, branchId, userId, userId]
     );
 
     if (branchRows.length === 0) {
@@ -153,15 +169,31 @@ const authenticateGymStaff = async (req, res, next) => {
 
     const [accessibleBranchRows] = await db.query(
       `SELECT b.id, b.name, b.branch_code
-       FROM user_branch_access uba
-       INNER JOIN branches b
-         ON b.organization_id = uba.organization_id
-        AND b.id = uba.branch_id
-       WHERE uba.organization_id = ?
-         AND uba.user_id = ?
+       FROM branches b
+       WHERE b.organization_id = ?
          AND b.status = 'active'
+         AND (
+           EXISTS (
+             SELECT 1
+             FROM user_roles ur
+             INNER JOIN roles r
+               ON r.organization_id = ur.organization_id
+              AND r.id = ur.role_id
+             WHERE ur.organization_id = b.organization_id
+               AND ur.user_id = ?
+               AND r.name = 'Gym Admin'
+               AND r.is_system_role = 1
+           )
+           OR EXISTS (
+             SELECT 1
+             FROM user_branch_access uba
+             WHERE uba.organization_id = b.organization_id
+               AND uba.user_id = ?
+               AND uba.branch_id = b.id
+           )
+         )
        ORDER BY b.name ASC, b.id ASC`,
-      [organizationId, userId]
+      [organizationId, userId, userId]
     );
 
     const user = users[0];

@@ -36,15 +36,31 @@ const getAccessibleBranches = async (
 ) => {
   const [rows] = await executor.query(
     `SELECT b.id, b.name, b.branch_code
-     FROM user_branch_access uba
-     INNER JOIN branches b
-       ON b.organization_id = uba.organization_id
-      AND b.id = uba.branch_id
-     WHERE uba.organization_id = ?
-       AND uba.user_id = ?
+     FROM branches b
+     WHERE b.organization_id = ?
        AND b.status = 'active'
+       AND (
+         EXISTS (
+           SELECT 1
+           FROM user_roles ur
+           INNER JOIN roles r
+             ON r.organization_id = ur.organization_id
+            AND r.id = ur.role_id
+           WHERE ur.organization_id = b.organization_id
+             AND ur.user_id = ?
+             AND r.name = 'Gym Admin'
+             AND r.is_system_role = 1
+         )
+         OR EXISTS (
+           SELECT 1
+           FROM user_branch_access uba
+           WHERE uba.organization_id = b.organization_id
+             AND uba.user_id = ?
+             AND uba.branch_id = b.id
+         )
+       )
      ORDER BY b.name ASC, b.id ASC`,
-    [organizationId, userId]
+    [organizationId, userId, userId]
   );
 
   return rows.map((row) => ({
@@ -116,17 +132,33 @@ const createGymStaffSession = async ({
 
     const [branchRows] = await connection.query(
       `SELECT b.id, b.name, b.branch_code
-       FROM user_branch_access uba
-       INNER JOIN branches b
-         ON b.organization_id = uba.organization_id
-        AND b.id = uba.branch_id
-       WHERE uba.organization_id = ?
-         AND uba.user_id = ?
-         AND uba.branch_id = ?
+       FROM branches b
+       WHERE b.organization_id = ?
+         AND b.id = ?
          AND b.status = 'active'
+         AND (
+           EXISTS (
+             SELECT 1
+             FROM user_roles ur
+             INNER JOIN roles r
+               ON r.organization_id = ur.organization_id
+              AND r.id = ur.role_id
+             WHERE ur.organization_id = b.organization_id
+               AND ur.user_id = ?
+               AND r.name = 'Gym Admin'
+               AND r.is_system_role = 1
+           )
+           OR EXISTS (
+             SELECT 1
+             FROM user_branch_access uba
+             WHERE uba.organization_id = b.organization_id
+               AND uba.user_id = ?
+               AND uba.branch_id = b.id
+           )
+         )
        LIMIT 1
        FOR UPDATE`,
-      [organizationId, userId, selectedBranchId]
+      [organizationId, selectedBranchId, userId, userId]
     );
 
     if (branchRows.length === 0) {
@@ -170,6 +202,7 @@ const createGymStaffSession = async ({
          ON p.id = rp.permission_id
        WHERE ur.organization_id = ?
          AND ur.user_id = ?
+         AND p.permission_scope = 'gym'
        ORDER BY p.permission_key ASC`,
       [organizationId, userId]
     );
@@ -455,64 +488,19 @@ const loginGymStaff = async (req, res) => {
       });
     }
 
-    // The registered branch is reference metadata only.
-    // Active branch selection is based on this staff member's authorized branches.
+    // The registered device branch is reference metadata only.
+    // Login starts with the first authorized active branch.
+    const selectedBranchId = requestedBranchId ?? branches[0].id;
 
-    let selectedBranchId = null;
+    const hasAccess = branches.some(
+      (branch) => branch.id === selectedBranchId
+    );
 
-    if (requestedBranchId !== null) {
-      const hasAccess = branches.some(
-        (branch) => branch.id === requestedBranchId
-      );
-
-      if (!hasAccess) {
-        return res.status(403).json({
-          success: false,
-          code: "BRANCH_ACCESS_DENIED",
-          message: "You do not have access to the selected branch",
-        });
-      }
-
-      selectedBranchId = requestedBranchId;
-
-    } else if (branches.length === 1) {
-      selectedBranchId = branches[0].id;
-
-    } else {
-      const selectionToken = jwt.sign(
-        {
-          token_type: "gym_branch_selection",
-          user_id: Number(user.id),
-          organization_id: organizationId,
-          device_id: Number(req.device.id),
-        },
-        secret,
-        {
-          expiresIn: "5m",
-          algorithm: "HS256",
-        }
-      );
-
-      return res.json({
-        success: true,
-        requires_branch_selection: true,
-        message: "Select a branch to continue",
-        selection_token: selectionToken,
-        selection_expires_in: "5m",
-
-        user: {
-          id: Number(user.id),
-          full_name: user.full_name,
-          username: user.username,
-          email: user.email,
-        },
-
-        organization: {
-          id: organizationId,
-          name: req.device.organizationName,
-        },
-
-        branches,
+    if (!hasAccess) {
+      return res.status(403).json({
+        success: false,
+        code: "BRANCH_ACCESS_DENIED",
+        message: "You do not have access to the selected branch",
       });
     }
 
