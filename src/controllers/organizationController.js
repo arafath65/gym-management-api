@@ -79,6 +79,7 @@ const createOrganization = async (req, res) => {
       expiresAt,
       adminName,
       adminUsername,
+      adminEmail,
       adminPassword,
       notes,
     } = req.body || {};
@@ -106,23 +107,45 @@ const createOrganization = async (req, res) => {
       });
     }
 
-    if (
-      typeof adminUsername !== "string" ||
-      !adminUsername.trim() ||
-      adminUsername.trim().length > 150
-    ) {
+    if (typeof adminUsername !== "string") {
       return res.status(400).json({
         success: false,
-        message: "Gym Admin username/email is required",
+        message: "Gym Admin username is required",
       });
     }
 
     const normalizedAdminUsername = adminUsername.trim().toLowerCase();
 
-    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(normalizedAdminUsername)) {
+    if (!/^[a-z0-9][a-z0-9._-]{2,49}$/.test(normalizedAdminUsername)) {
       return res.status(400).json({
         success: false,
-        message: "Gym Admin username must be a valid email address",
+        message: "Username must be 3-50 characters and use lowercase letters, numbers, dots, underscores or hyphens",
+      });
+    }
+
+    if (adminEmail !== undefined && adminEmail !== null &&
+        typeof adminEmail !== "string") {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid Gym Admin email address",
+      });
+    }
+
+    const normalizedAdminEmail =
+      typeof adminEmail === "string" && adminEmail.trim()
+        ? adminEmail.trim().toLowerCase()
+        : null;
+
+    if (
+      normalizedAdminEmail &&
+      (
+        normalizedAdminEmail.length > 150 ||
+        !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedAdminEmail)
+      )
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Gym Admin email must be a valid email address",
       });
     }
 
@@ -322,12 +345,13 @@ const createOrganization = async (req, res) => {
     // ------------------------------------------------
     const [gymAdminUserResult] = await connection.query(
       `INSERT INTO users
-       (organization_id, full_name, email, phone, password_hash, status)
-       VALUES (?, ?, ?, NULL, ?, 'active')`,
+       (organization_id, full_name, username, email, phone, password_hash, status)
+       VALUES (?, ?, ?, ?, NULL, ?, 'active')`,
       [
         organizationId,
         normalizedAdminName,
         normalizedAdminUsername,
+        normalizedAdminEmail,
         adminPasswordHash,
       ]
     );
@@ -399,7 +423,8 @@ const createOrganization = async (req, res) => {
       newValues: {
         user_id: gymAdminUserId,
         full_name: normalizedAdminName,
-        email: normalizedAdminUsername,
+        username: normalizedAdminUsername,
+        email: normalizedAdminEmail,
         role: "Gym Admin",
       },
       ipAddress: req.ip || null,
@@ -443,7 +468,8 @@ const createOrganization = async (req, res) => {
       gymAdmin: {
         id: gymAdminUserId,
         full_name: normalizedAdminName,
-        email: normalizedAdminUsername,
+        username: normalizedAdminUsername,
+        email: normalizedAdminEmail,
         role: "Gym Admin",
         status: "active",
       },
@@ -560,27 +586,64 @@ const updateOrganization = async (req, res) => {
       });
     }
 
+    const gymOwnerEmailProvided =
+      Object.prototype.hasOwnProperty.call(body, "gymOwnerEmail");
+
     const gymOwnerFieldsProvided =
       Object.prototype.hasOwnProperty.call(body, "gymOwnerName") ||
-      Object.prototype.hasOwnProperty.call(body, "gymOwnerUsername");
+      Object.prototype.hasOwnProperty.call(body, "gymOwnerUsername") ||
+      gymOwnerEmailProvided;
+
     const normalizedGymOwnerName =
       typeof body.gymOwnerName === "string" ? body.gymOwnerName.trim() : "";
+
     const normalizedGymOwnerUsername =
       typeof body.gymOwnerUsername === "string"
         ? body.gymOwnerUsername.trim().toLowerCase()
         : "";
 
+    let normalizedGymOwnerEmail = null;
+
+    if (gymOwnerEmailProvided) {
+      if (
+        body.gymOwnerEmail !== null &&
+        body.gymOwnerEmail !== undefined &&
+        typeof body.gymOwnerEmail !== "string"
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid Gym Owner email address",
+        });
+      }
+
+      normalizedGymOwnerEmail =
+        typeof body.gymOwnerEmail === "string" && body.gymOwnerEmail.trim()
+          ? body.gymOwnerEmail.trim().toLowerCase()
+          : null;
+
+      if (
+        normalizedGymOwnerEmail &&
+        (
+          normalizedGymOwnerEmail.length > 150 ||
+          !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedGymOwnerEmail)
+        )
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Gym Owner email must be a valid email address",
+        });
+      }
+    }
+
     if (gymOwnerFieldsProvided) {
       if (
         !normalizedGymOwnerName ||
         normalizedGymOwnerName.length > 150 ||
-        !normalizedGymOwnerUsername ||
-        normalizedGymOwnerUsername.length > 150 ||
-        !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(normalizedGymOwnerUsername)
+        !/^[a-z0-9][a-z0-9._-]{2,49}$/.test(normalizedGymOwnerUsername)
       ) {
         return res.status(400).json({
           success: false,
-          message: "Gym Owner name and a valid login email are required",
+          message: "Gym Owner name and a valid 3-50 character username are required",
         });
       }
     }
@@ -867,7 +930,7 @@ const updateOrganization = async (req, res) => {
 
     if (gymOwnerFieldsProvided) {
       const [gymOwners] = await connection.query(
-        `SELECT u.id, u.full_name, u.email
+        `SELECT u.id, u.full_name, u.username, u.email
          FROM users u
          INNER JOIN user_roles ur
            ON ur.organization_id = u.organization_id
@@ -898,7 +961,7 @@ const updateOrganization = async (req, res) => {
         `SELECT id
          FROM users
          WHERE organization_id = ?
-           AND email = ?
+           AND username = ?
            AND id <> ?
          LIMIT 1`,
         [organizationId, normalizedGymOwnerUsername, oldGymOwner.id]
@@ -909,17 +972,43 @@ const updateOrganization = async (req, res) => {
         transactionStarted = false;
         return res.status(409).json({
           success: false,
-          message: "This login username is already used by another user in this organization",
+          message: "This username is already used by another account in this organization",
         });
+      }
+
+      const finalGymOwnerEmail = gymOwnerEmailProvided
+        ? normalizedGymOwnerEmail
+        : oldGymOwner.email;
+
+      if (finalGymOwnerEmail) {
+        const [duplicateEmails] = await connection.query(
+          `SELECT id
+           FROM users
+           WHERE organization_id = ?
+             AND email = ?
+             AND id <> ?
+           LIMIT 1`,
+          [organizationId, finalGymOwnerEmail, oldGymOwner.id]
+        );
+
+        if (duplicateEmails.length > 0) {
+          await connection.rollback();
+          transactionStarted = false;
+          return res.status(409).json({
+            success: false,
+            message: "This email is already used by another account in this organization",
+          });
+        }
       }
 
       await connection.query(
         `UPDATE users
-         SET full_name = ?, email = ?, updated_at = NOW()
+         SET full_name = ?, username = ?, email = ?, updated_at = NOW()
          WHERE id = ? AND organization_id = ?`,
         [
           normalizedGymOwnerName,
           normalizedGymOwnerUsername,
+          finalGymOwnerEmail,
           oldGymOwner.id,
           organizationId,
         ]
@@ -928,7 +1017,8 @@ const updateOrganization = async (req, res) => {
       updatedGymOwner = {
         id: oldGymOwner.id,
         full_name: normalizedGymOwnerName,
-        email: normalizedGymOwnerUsername,
+        username: normalizedGymOwnerUsername,
+        email: finalGymOwnerEmail,
       };
 
       await writePlatformAuditLog(connection, {
@@ -940,11 +1030,13 @@ const updateOrganization = async (req, res) => {
         description: `Updated Gym Owner account ${normalizedGymOwnerUsername}`,
         oldValues: {
           full_name: oldGymOwner.full_name,
+          username: oldGymOwner.username,
           email: oldGymOwner.email,
         },
         newValues: {
           full_name: normalizedGymOwnerName,
-          email: normalizedGymOwnerUsername,
+          username: normalizedGymOwnerUsername,
+          email: finalGymOwnerEmail,
         },
         ipAddress: req.ip || null,
         userAgent: req.get("user-agent") || null,
@@ -1136,7 +1228,8 @@ const provisionLegacyOrganizationGymOwner = async (req, res) => {
 
     const {
       fullName,
-      email,
+      username,
+      email = null,
       password,
       phone = null,
     } = req.body || {};
@@ -1171,23 +1264,48 @@ const provisionLegacyOrganizationGymOwner = async (req, res) => {
     }
 
     // ------------------------------------------------
-    // VALIDATE EMAIL
+    // VALIDATE USERNAME
     // ------------------------------------------------
 
-    if (
-      typeof email !== "string" ||
-      !email.trim() ||
-      email.trim().length > 150
-    ) {
+    if (typeof username !== "string") {
       return res.status(400).json({
         success: false,
-        message: "Gym Owner email is required",
+        message: "Gym Owner username is required",
       });
     }
 
-    const normalizedEmail = email.trim().toLowerCase();
+    const normalizedUsername = username.trim().toLowerCase();
 
-    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(normalizedEmail)) {
+    if (!/^[a-z0-9][a-z0-9._-]{2,49}$/.test(normalizedUsername)) {
+      return res.status(400).json({
+        success: false,
+        message: "Username must be 3-50 characters and use lowercase letters, numbers, dots, underscores or hyphens",
+      });
+    }
+
+    // ------------------------------------------------
+    // VALIDATE OPTIONAL EMAIL
+    // ------------------------------------------------
+
+    if (email !== undefined && email !== null && typeof email !== "string") {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid Gym Owner email address",
+      });
+    }
+
+    const normalizedEmail =
+      typeof email === "string" && email.trim()
+        ? email.trim().toLowerCase()
+        : null;
+
+    if (
+      normalizedEmail &&
+      (
+        normalizedEmail.length > 150 ||
+        !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)
+      )
+    ) {
       return res.status(400).json({
         success: false,
         message: "Gym Owner email must be a valid email address",
@@ -1307,24 +1425,37 @@ const provisionLegacyOrganizationGymOwner = async (req, res) => {
     }
 
     // ------------------------------------------------
-    // PREVENT DUPLICATE EMAIL
+    // PREVENT DUPLICATE USERNAME AND EMAIL
     // ------------------------------------------------
 
-    const [duplicateUsers] = await connection.query(
-      `SELECT id
-       FROM users
-       WHERE organization_id = ?
-         AND email = ?
-       LIMIT 1
-       FOR UPDATE`,
-      [organizationId, normalizedEmail]
+    const [duplicateUsernames] = await connection.query(
+      `SELECT id FROM users
+       WHERE organization_id = ? AND username = ?
+       LIMIT 1 FOR UPDATE`,
+      [organizationId, normalizedUsername]
     );
 
-    if (duplicateUsers.length > 0) {
+    if (duplicateUsernames.length > 0) {
       return await rejectWithRollback(
         409,
-        "This email address is already registered in the organization"
+        "This username is already registered in the organization"
       );
+    }
+
+    if (normalizedEmail) {
+      const [duplicateEmails] = await connection.query(
+        `SELECT id FROM users
+         WHERE organization_id = ? AND email = ?
+         LIMIT 1 FOR UPDATE`,
+        [organizationId, normalizedEmail]
+      );
+
+      if (duplicateEmails.length > 0) {
+        return await rejectWithRollback(
+          409,
+          "This email address is already registered in the organization"
+        );
+      }
     }
 
     // ------------------------------------------------
@@ -1336,15 +1467,17 @@ const provisionLegacyOrganizationGymOwner = async (req, res) => {
        (
          organization_id,
          full_name,
+         username,
          email,
          phone,
          password_hash,
          status
        )
-       VALUES (?, ?, ?, ?, ?, 'active')`,
+       VALUES (?, ?, ?, ?, ?, ?, 'active')`,
       [
         organizationId,
         normalizedName,
+        normalizedUsername,
         normalizedEmail,
         normalizedPhone,
         passwordHash,
@@ -1449,11 +1582,12 @@ const provisionLegacyOrganizationGymOwner = async (req, res) => {
       entityType: "user",
       entityId: gymAdminUserId,
       description:
-        `Provisioned legacy Gym Owner account ${normalizedEmail} for ${organization.name}`,
+        `Provisioned legacy Gym Owner account ${normalizedUsername} for ${organization.name}`,
       oldValues: null,
       newValues: {
         user_id: gymAdminUserId,
         full_name: normalizedName,
+        username: normalizedUsername,
         email: normalizedEmail,
         phone: normalizedPhone,
         role: "Gym Admin",
@@ -1474,7 +1608,7 @@ const provisionLegacyOrganizationGymOwner = async (req, res) => {
       entityType: "role",
       entityId: gymAdminRoleId,
       description:
-        `Assigned system Gym Admin role to ${normalizedEmail}`,
+        `Assigned system Gym Admin role to ${normalizedUsername}`,
       oldValues: null,
       newValues: {
         role_id: gymAdminRoleId,
@@ -1530,6 +1664,7 @@ const provisionLegacyOrganizationGymOwner = async (req, res) => {
       gymOwner: {
         id: gymAdminUserId,
         full_name: normalizedName,
+        username: normalizedUsername,
         email: normalizedEmail,
         phone: normalizedPhone,
         role: "Gym Admin",
@@ -1591,7 +1726,7 @@ const getOrganizationGymOwner = async (req, res) => {
     }
 
     const [owners] = await db.query(
-      `SELECT u.id, u.full_name, u.email
+      `SELECT u.id, u.full_name, u.username, u.email
        FROM users u
        INNER JOIN user_roles ur
          ON ur.organization_id = u.organization_id AND ur.user_id = u.id

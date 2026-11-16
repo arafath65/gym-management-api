@@ -78,7 +78,7 @@ const createGymStaffSession = async ({
     transactionStarted = true;
 
     const [users] = await connection.query(
-      `SELECT id, organization_id, full_name, email, status
+      `SELECT id, organization_id, full_name, username, email, status
        FROM users
        WHERE id = ?
          AND organization_id = ?
@@ -259,6 +259,7 @@ const createGymStaffSession = async ({
       user: {
         id: Number(user.id),
         full_name: user.full_name,
+        username: user.username,
         email: user.email,
       },
 
@@ -323,20 +324,22 @@ const loginGymStaff = async (req, res) => {
     const secret = getGymStaffSecret();
 
     const body = req.body || {};
-    const email = body.email;
+    // identifier is the new contract; body.email remains supported for older app builds.
+    const identifierInput =
+      typeof body.identifier === "string" ? body.identifier : body.email;
     const password = body.password;
 
     if (
-      typeof email !== "string" ||
-      !email.trim() ||
-      email.trim().length > 150 ||
+      typeof identifierInput !== "string" ||
+      !identifierInput.trim() ||
+      identifierInput.trim().length > 150 ||
       typeof password !== "string" ||
       !password ||
       Buffer.byteLength(password, "utf8") > 72
     ) {
       return res.status(400).json({
         success: false,
-        message: "A valid email and password are required",
+        message: "A valid username or email and password are required",
       });
     }
 
@@ -356,22 +359,38 @@ const loginGymStaff = async (req, res) => {
       });
     }
 
-    const normalizedEmail = email.trim().toLowerCase();
+    const normalizedIdentifier = identifierInput.trim().toLowerCase();
+    const isEmailIdentifier = normalizedIdentifier.includes("@");
 
-    // Never accept organization_id from the login request.
+    if (
+      isEmailIdentifier
+        ? !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedIdentifier)
+        : !/^[a-z0-9][a-z0-9._-]{2,49}$/.test(normalizedIdentifier)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Enter a valid username or email address",
+      });
+    }
+
+    // The organization is always taken from the authenticated device.
+    // The column name is selected only from these two fixed values.
+    const identityColumn = isEmailIdentifier ? "email" : "username";
+
     const [users] = await db.query(
       `SELECT
          id,
          organization_id,
          full_name,
+         username,
          email,
          password_hash,
          status
        FROM users
        WHERE organization_id = ?
-         AND email = ?
+         AND ${identityColumn} = ?
        LIMIT 1`,
-      [organizationId, normalizedEmail]
+      [organizationId, normalizedIdentifier]
     );
 
     if (users.length === 0) {
@@ -484,6 +503,7 @@ const loginGymStaff = async (req, res) => {
         user: {
           id: Number(user.id),
           full_name: user.full_name,
+          username: user.username,
           email: user.email,
         },
 

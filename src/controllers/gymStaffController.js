@@ -516,11 +516,11 @@ const listGymStaff = async (req, res) => {
 
     if (search) {
       conditions.push(`(
-        u.full_name LIKE ? OR u.email LIKE ?
+        u.full_name LIKE ? OR u.username LIKE ? OR u.email LIKE ?
         OR COALESCE(u.phone, '') LIKE ?
       )`);
       const term = `%${search}%`;
-      params.push(term, term, term);
+      params.push(term, term, term, term);
     }
 
     const whereSql = conditions.join(" AND ");
@@ -538,7 +538,7 @@ const listGymStaff = async (req, res) => {
     const offset = (currentPage - 1) * pageSize;
 
     const [staffRows] = await db.query(
-      `SELECT u.id, u.full_name, u.email, u.phone, u.status,
+      `SELECT u.id, u.full_name, u.username, u.email, u.phone, u.status,
               u.last_login_at, u.created_at, u.updated_at
        FROM users u
        WHERE ${whereSql}
@@ -598,7 +598,7 @@ const getGymStaff = async (req, res) => {
     }
 
     let sql = `
-      SELECT u.id, u.full_name, u.email, u.phone, u.status,
+      SELECT u.id, u.full_name, u.username, u.email, u.phone, u.status,
              u.last_login_at, u.created_at, u.updated_at
       FROM users u
       WHERE u.organization_id = ?
@@ -674,7 +674,11 @@ const createGymStaff = async (req, res) => {
     const body = req.body || {};
 
     const fullName = typeof body.full_name === "string" ? body.full_name.trim() : "";
-    const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
+    const username = typeof body.username === "string" ? body.username.trim().toLowerCase() : "";
+    const email = body.email == null ||
+      (typeof body.email === "string" && body.email.trim() === "")
+      ? null
+      : typeof body.email === "string" ? body.email.trim().toLowerCase() : undefined;
     const phone = body.phone == null || body.phone === ""
       ? null
       : typeof body.phone === "string" ? body.phone.trim() : undefined;
@@ -684,8 +688,13 @@ const createGymStaff = async (req, res) => {
       throw httpError("Valid full_name is required (maximum 150 characters).");
     }
 
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 150) {
-      throw httpError("A valid email address is required.");
+    if (!/^[a-z0-9][a-z0-9._-]{2,49}$/.test(username)) {
+      throw httpError("Username must be 3-50 characters and use lowercase letters, numbers, dots, underscores, or hyphens.");
+    }
+
+    if (email !== null && (email === undefined ||
+        !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 150)) {
+      throw httpError("Enter a valid email address or leave it blank.");
     }
 
     if (phone === undefined || (phone && phone.length > 30)) {
@@ -708,28 +717,47 @@ const createGymStaff = async (req, res) => {
       await assertRequestedBranchesAllowed(connection, req, branchIds);
       await assertRolesAssignable(connection, req, roleIds);
 
-      const [duplicates] = await connection.query(
+      const [usernameDuplicates] = await connection.query(
         `SELECT id
          FROM users
-         WHERE organization_id = ? AND email = ?
+         WHERE organization_id = ? AND username = ?
          LIMIT 1
          FOR UPDATE`,
-        [organizationId, email]
+        [organizationId, username]
       );
 
-      if (duplicates.length > 0) {
+      if (usernameDuplicates.length > 0) {
         throw httpError(
-          "A staff account with this email already exists.",
+          "A staff account with this username already exists.",
           409,
-          "DUPLICATE_STAFF_EMAIL"
+          "DUPLICATE_STAFF_USERNAME"
         );
+      }
+
+      if (email !== null) {
+        const [emailDuplicates] = await connection.query(
+          `SELECT id
+           FROM users
+           WHERE organization_id = ? AND email = ?
+           LIMIT 1
+           FOR UPDATE`,
+          [organizationId, email]
+        );
+
+        if (emailDuplicates.length > 0) {
+          throw httpError(
+            "A staff account with this email already exists.",
+            409,
+            "DUPLICATE_STAFF_EMAIL"
+          );
+        }
       }
 
       const [insertResult] = await connection.query(
         `INSERT INTO users
-          (organization_id, full_name, email, phone, password_hash, status)
-         VALUES (?, ?, ?, ?, ?, 'active')`,
-        [organizationId, fullName, email, phone, passwordHash]
+          (organization_id, full_name, username, email, phone, password_hash, status)
+         VALUES (?, ?, ?, ?, ?, ?, 'active')`,
+        [organizationId, fullName, username, email, phone, passwordHash]
       );
 
       const staffId = Number(insertResult.insertId);
@@ -761,7 +789,7 @@ const createGymStaff = async (req, res) => {
       await writeStaffAuditLog(connection, req, {
         action: "GYM_STAFF_CREATED",
         staffId,
-        description: `Created staff account ${fullName} (${email}); role_ids=${roleIds.join(",")}; branch_ids=${branchIds.join(",")}`,
+        description: `Created staff account ${fullName} (${username}; email=${email || "not provided"}); role_ids=${roleIds.join(",")}; branch_ids=${branchIds.join(",")}`,
       });
 
       return { staffId };
@@ -787,7 +815,7 @@ const updateGymStaff = async (req, res) => {
       throw httpError("Invalid staff ID.");
     }
 
-    const allowedFields = new Set(["full_name", "email", "phone", "password"]);
+    const allowedFields = new Set(["full_name", "username", "email", "phone", "password"]);
     const unknownFields = Object.keys(body).filter((key) => !allowedFields.has(key));
 
     if (unknownFields.length > 0) {
@@ -797,6 +825,8 @@ const updateGymStaff = async (req, res) => {
     const updates = [];
     const values = [];
     const auditChanges = [];
+    let normalizedUsername = null;
+    let normalizedEmail = null;
 
     if (Object.prototype.hasOwnProperty.call(body, "full_name")) {
       if (typeof body.full_name !== "string" ||
@@ -809,17 +839,39 @@ const updateGymStaff = async (req, res) => {
       auditChanges.push("name updated");
     }
 
+    if (Object.prototype.hasOwnProperty.call(body, "username")) {
+      if (typeof body.username !== "string") {
+        throw httpError("Invalid username.");
+      }
+
+      normalizedUsername = body.username.trim().toLowerCase();
+
+      if (!/^[a-z0-9][a-z0-9._-]{2,49}$/.test(normalizedUsername)) {
+        throw httpError("Username must be 3-50 characters and use lowercase letters, numbers, dots, underscores, or hyphens.");
+      }
+
+      updates.push("username = ?");
+      values.push(normalizedUsername);
+      auditChanges.push("username updated");
+    }
+
     if (Object.prototype.hasOwnProperty.call(body, "email")) {
-      if (typeof body.email !== "string") {
+      if (body.email !== null && typeof body.email !== "string") {
         throw httpError("Invalid email address.");
       }
-      const email = body.email.trim().toLowerCase();
-      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 150) {
-        throw httpError("A valid email address is required.");
+
+      const emailInput = body.email === null ? "" : body.email.trim();
+
+      normalizedEmail = emailInput === "" ? null : emailInput.toLowerCase();
+
+      if (normalizedEmail !== null &&
+          (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail) || normalizedEmail.length > 150)) {
+        throw httpError("Enter a valid email address or clear the field.");
       }
+
       updates.push("email = ?");
-      values.push(email);
-      auditChanges.push("email updated");
+      values.push(normalizedEmail);
+      auditChanges.push(normalizedEmail === null ? "email cleared" : "email updated");
     }
 
     if (Object.prototype.hasOwnProperty.call(body, "phone")) {
@@ -868,16 +920,37 @@ const updateGymStaff = async (req, res) => {
         );
       }
 
-      if (Object.prototype.hasOwnProperty.call(body, "email")) {
-        const emailValue = values[updates.indexOf("email = ?")];
+      if (Object.prototype.hasOwnProperty.call(body, "username")) {
+        const [duplicates] = await connection.query(
+          `SELECT id
+           FROM users
+           WHERE organization_id = ?
+             AND username = ?
+             AND id <> ?
+           LIMIT 1
+           FOR UPDATE`,
+          [organizationId, normalizedUsername, staffId]
+        );
+
+        if (duplicates.length > 0) {
+          throw httpError(
+            "A staff account with this username already exists.",
+            409,
+            "DUPLICATE_STAFF_USERNAME"
+          );
+        }
+      }
+
+      if (Object.prototype.hasOwnProperty.call(body, "email") && normalizedEmail !== null) {
         const [duplicates] = await connection.query(
           `SELECT id
            FROM users
            WHERE organization_id = ?
              AND email = ?
              AND id <> ?
-           LIMIT 1`,
-          [organizationId, emailValue, staffId]
+           LIMIT 1
+           FOR UPDATE`,
+          [organizationId, normalizedEmail, staffId]
         );
 
         if (duplicates.length > 0) {

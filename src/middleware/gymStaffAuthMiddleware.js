@@ -76,7 +76,7 @@ const authenticateGymStaff = async (req, res, next) => {
 
   try {
     const [users] = await db.query(
-      `SELECT id, organization_id, full_name, email, status
+      `SELECT id, organization_id, full_name, username, email, status
        FROM users
        WHERE id = ?
          AND organization_id = ?
@@ -178,6 +178,7 @@ const authenticateGymStaff = async (req, res, next) => {
       user: {
         id: userId,
         full_name: user.full_name,
+        username: user.username,
         email: user.email,
       },
 
