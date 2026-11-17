@@ -474,8 +474,33 @@ const listGymStaff = async (req, res) => {
       throw httpError("Search cannot exceed 100 characters.");
     }
 
+    // The selected branch comes from the verified Gym Staff JWT.
+    // Never accept a client-supplied branch ID for this filter.
+    const activeBranchId = parsePositiveId(req.gymStaff?.branchId);
+
+    if (!activeBranchId || !actorBranchIds.includes(activeBranchId)) {
+      throw httpError(
+        "The active branch is invalid or unavailable.",
+        403,
+        "ACTIVE_BRANCH_ACCESS_DENIED"
+      );
+    }
+
     const conditions = ["u.organization_id = ?"];
     const params = [organizationId];
+
+    // Show only staff assigned to the active working branch.
+    // This applies to Gym Admins and regular staff.
+    conditions.push(`
+      EXISTS (
+        SELECT 1
+        FROM user_branch_access active_branch
+        WHERE active_branch.organization_id = u.organization_id
+          AND active_branch.user_id = u.id
+          AND active_branch.branch_id = ?
+      )
+    `);
+    params.push(activeBranchId);
 
     if (!ownerView) {
       const placeholders = actorBranchIds.map(() => "?").join(", ");

@@ -17,6 +17,8 @@ const gymBranchRoutes = require('./routes/gymBranchRoutes');
 const gymDeviceRoutes = require("./routes/gymDeviceRoutes");
 const gymRoleRoutes = require("./routes/gymRoleRoutes");
 const gymStaffRoutes = require("./routes/gymStaffRoutes");
+const trainerRoutes = require("./routes/trainerRoutes");
+const memberRoutes = require("./routes/memberRoutes");
 
 const app = express();
 
@@ -36,6 +38,8 @@ app.use('/api/gym-branches', gymBranchRoutes);
 app.use("/api/gym-devices", gymDeviceRoutes);
 app.use("/api/gym-roles", gymRoleRoutes);
 app.use("/api/gym-staff", gymStaffRoutes);
+app.use("/api/trainers", trainerRoutes);
+app.use("/api/members", memberRoutes);
 
 
 app.get("/", (req, res) => {
