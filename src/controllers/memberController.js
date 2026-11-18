@@ -134,7 +134,15 @@ const maskPhone = (value) => {
 
 const dateToString = (value) => {
   if (!value) return null;
-  if (value instanceof Date) return value.toISOString().slice(0, 10);
+  if (typeof value === 'string') return value.slice(0, 10);
+  if (value instanceof Date) {
+    // MySQL DATE values may be materialized as local-midnight Date objects.
+    // Do not convert them to UTC with toISOString(), which can shift the day.
+    const year = value.getFullYear();
+    const month = String(value.getMonth() + 1).padStart(2, '0');
+    const day = String(value.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  }
   return String(value).slice(0, 10);
 };
 
@@ -163,6 +171,7 @@ const getMemberResponse = (row) => ({
   admission_fee_status: row.admission_fee_status,
   admission_fee_amount: String(row.admission_fee_amount),
   admission_fee_currency: row.admission_fee_currency,
+  has_profile_photo: Boolean(row.profile_photo_path),
   created_at: row.created_at,
 });
 
@@ -338,7 +347,7 @@ const createMember = async (req, res) => {
         ? 'walk_in'
         : body.registration_source;
 
-    if (!['walk_in', 'referral', 'facebook', 'website', 'other'].includes(registrationSource)) {
+    if (!['walk_in', 'referral', 'friend', 'facebook', 'social_media', 'website', 'other'].includes(registrationSource)) {
       errors.push('Registration source is invalid.');
     }
 
@@ -756,9 +765,10 @@ const createMember = async (req, res) => {
          nic_type,
          nic_last4,
          full_name,
-         date_of_birth,
+         DATE_FORMAT(date_of_birth, '%Y-%m-%d') AS date_of_birth,
          date_of_birth_source,
          date_of_birth_confirmed,
+         profile_photo_path,
          gender,
          phone_primary,
          phone_secondary,

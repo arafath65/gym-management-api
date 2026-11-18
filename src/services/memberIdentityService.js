@@ -42,17 +42,25 @@ const isLeapYear = (year) =>
   year % 400 === 0 || (year % 4 === 0 && year % 100 !== 0);
 
 const dateFromDayOfYear = (year, dayOfYear) => {
-  const maximumDay = isLeapYear(year) ? 366 : 365;
-
   if (
     !Number.isInteger(dayOfYear) ||
     dayOfYear < 1 ||
-    dayOfYear > maximumDay
+    dayOfYear > 366
   ) {
     return null;
   }
 
-  const date = new Date(Date.UTC(year, 0, dayOfYear));
+  // NIC day numbers use a fixed leap-year reference calendar.
+  const referenceDate = new Date(Date.UTC(2000, 0, dayOfYear));
+  const month = referenceDate.getUTCMonth();
+  const day = referenceDate.getUTCDate();
+
+  // February 29 is invalid in a non-leap birth year.
+  if (month === 1 && day === 29 && !isLeapYear(year)) {
+    return null;
+  }
+
+  const date = new Date(Date.UTC(year, month, day));
   const dateString = date.toISOString().slice(0, 10);
   const today = new Date().toISOString().slice(0, 10);
 
@@ -60,7 +68,6 @@ const dateFromDayOfYear = (year, dayOfYear) => {
 
   return dateString;
 };
-
 const decodeSriLankanNic = (value) => {
   const nic = parseSriLankanNic(value);
 
