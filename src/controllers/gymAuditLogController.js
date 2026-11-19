@@ -190,6 +190,9 @@ const getGymAuditLogs = async (req, res) => {
          al.entity_type,
          al.entity_id,
          al.description,
+         al.old_values,
+         al.new_values,
+         al.metadata,
          al.created_at
        ${joins}
        ${whereSql}
@@ -240,19 +243,83 @@ const getGymAuditLogs = async (req, res) => {
       success: true,
       logs: rows.map((row) => {
         const parsed = parseDescription(row.description);
+
+        const parseAuditJson = (value) => {
+          if (value === null || value === undefined) return null;
+          if (typeof value !== 'string') return value;
+
+          try {
+            return JSON.parse(value);
+          } catch (_) {
+            return null;
+          }
+        };
+
+        // Never expose NIC values or cryptographic material through audit responses.
+        const sensitiveAuditKeys = new Set([
+          'nic',
+          'nicplain',
+          'nicplaintext',
+          'nicnumber',
+          'nicvalue',
+          'nicciphertext',
+          'nicencrypted',
+          'niciv',
+          'nicauthtag',
+          'nicauthenticationtag',
+          'nichash',
+          'nichmac',
+          'niclookuphash',
+          'niclast4',
+          'nicencryptionkey',
+        ]);
+
+        const sanitizeAuditPayload = (value) => {
+          if (Array.isArray(value)) {
+            return value.map(sanitizeAuditPayload);
+          }
+
+          if (value === null || typeof value !== 'object') {
+            return value;
+          }
+
+          return Object.fromEntries(
+            Object.entries(value)
+              .filter(([key]) => {
+                const normalizedKey = String(key)
+                  .toLowerCase()
+                  .replace(/[^a-z0-9]/g, '');
+
+                return !sensitiveAuditKeys.has(normalizedKey);
+              })
+              .map(([key, item]) => [
+                key,
+                sanitizeAuditPayload(item),
+              ]),
+          );
+        };
+
+        const oldValues = parseAuditJson(row.old_values);
+        const newValues = parseAuditJson(row.new_values);
+        const metadata = parseAuditJson(row.metadata);
         return {
           id: Number(row.id),
           organization_id: Number(row.organization_id),
           branch_id: row.branch_id == null ? null : Number(row.branch_id),
           branch_name: row.branch_name,
+          action_branch_id: row.branch_id == null ? null : Number(row.branch_id),
+          action_branch_name: row.branch_name,
           user_id: row.user_id == null ? null : Number(row.user_id),
           user_name: row.user_name,
+          actor_user_id: row.user_id == null ? null : Number(row.user_id),
+          actor_user_name: row.user_name,
           action: row.action,
           entity_type: row.entity_type,
           entity_id: row.entity_id == null ? null : Number(row.entity_id),
           message: parsed.message,
-          old_values: parsed.old_values,
-          new_values: parsed.new_values,
+          old_values: sanitizeAuditPayload(oldValues ?? parsed.old_values) ?? null,
+          new_values: sanitizeAuditPayload(newValues ?? parsed.new_values) ?? null,
+          metadata: sanitizeAuditPayload(metadata),
           created_at: row.created_at,
         };
       }),

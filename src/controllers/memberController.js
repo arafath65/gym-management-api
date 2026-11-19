@@ -1,6 +1,10 @@
 'use strict';
 
 const db = require('../config/db');
+const {
+  writeAuditLog,
+  buildMemberAuditMetadata,
+} = require('../services/gymAuditService');
 
 const {
   parseSriLankanNic,
@@ -197,44 +201,50 @@ const writeMemberAuditLog = async (connection, req, member) => {
   const organizationId = Number(req.gymStaff.organizationId);
   const userId = Number(req.gymStaff.userId);
   const branchId = Number(req.gymStaff.branchId);
+  const registrationBranchId = Number(member.registration_branch_id);
 
-  const safeValues = {
+  const [branchRows] = await connection.query(
+    `SELECT name, branch_code
+     FROM branches
+     WHERE organization_id = ? AND id = ?
+     LIMIT 1`,
+    [organizationId, registrationBranchId]
+  );
+
+  const registrationBranch = branchRows[0] || {};
+
+  const memberWithBranch = {
+    ...member,
+    registration_branch_name: registrationBranch.name || null,
+    registration_branch_code: registrationBranch.branch_code || null,
+  };
+
+  const newValues = {
     member_code: member.member_code,
     status: member.status,
-    registration_branch_id: member.registration_branch_id,
-    preferred_branch_id: member.preferred_branch_id,
+    registration_branch_id: registrationBranchId,
+    preferred_branch_id: member.preferred_branch_id == null
+      ? null
+      : Number(member.preferred_branch_id),
+    registration_source: member.registration_source || null,
     admission_fee_status: member.admission_fee_status,
     admission_fee_amount: String(member.admission_fee_amount),
     admission_fee_currency: member.admission_fee_currency,
-    nic_type: member.nic_type,
-    nic_last4: member.nic_last4,
   };
 
-  await connection.query(
-    `INSERT INTO audit_logs
-      (
-        organization_id,
-        branch_id,
-        user_id,
-        action,
-        entity_type,
-        entity_id,
-        description,
-        ip_address,
-        user_agent
-      )
-     VALUES (?, ?, ?, 'MEMBER_REGISTERED', 'member', ?, ?, ?, ?)`,
-    [
-      organizationId,
-      branchId,
-      userId,
-      member.id,
-      `Registered member ${member.member_code} | new_values=${JSON.stringify(safeValues)}`,
-      req.ip || null,
-      req.get('user-agent')
-        ? req.get('user-agent').substring(0, 500)
-        : null,
-    ]
+  await writeAuditLog(
+    connection,
+    req,
+    { organizationId, branchId, userId },
+    {
+      action: 'MEMBER_REGISTERED',
+      entityType: 'member',
+      entityId: member.id,
+      description: `Registered member ${member.member_code}.`,
+      oldValues: null,
+      newValues,
+      metadata: buildMemberAuditMetadata(memberWithBranch),
+    }
   );
 };
 

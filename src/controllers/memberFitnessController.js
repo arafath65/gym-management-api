@@ -1,6 +1,10 @@
 'use strict';
 
 const db = require('../config/db');
+const {
+  writeAuditLog,
+  buildMemberAuditMetadata,
+} = require('../services/gymAuditService');
 const memberProgressPhotoStorage = require('../services/storage/memberProgressPhotoStorage');
 const {
   MemberProgressPhotoValidationError,
@@ -235,16 +239,24 @@ const serializeAssessment = (row) => ({
 
 const ensureMember = async (connection, context, forUpdate = false) => {
   const [rows] = await connection.query(
-    `SELECT id, member_code
-     FROM members
-     WHERE organization_id = ?
-       AND id = ?
+    `SELECT
+       m.id,
+       m.member_code,
+       m.registration_branch_id,
+       b.name AS registration_branch_name,
+       b.branch_code AS registration_branch_code
+     FROM members m
+     INNER JOIN branches b
+       ON b.organization_id = m.organization_id
+      AND b.id = m.registration_branch_id
+     WHERE m.organization_id = ?
+       AND m.id = ?
      LIMIT 1${forUpdate ? ' FOR UPDATE' : ''}`,
     [context.organizationId, context.memberId]
   );
 
   if (rows.length === 0) {
-    throw new FitnessHttpError(404, 'MEMBER_NOT_FOUND_IN_ACTIVE_BRANCH', 'Member was not found in the active branch.');
+    throw new FitnessHttpError(404, 'MEMBER_NOT_FOUND', 'Member was not found in this organization.');
   }
 
   return rows[0];
@@ -270,34 +282,7 @@ const ensureAssessment = async (connection, context, progressId, forUpdate = fal
   return rows[0];
 };
 
-const audit = async (connection, req, context, entry) => {
-  await connection.query(
-    `INSERT INTO audit_logs
-      (
-        organization_id,
-        branch_id,
-        user_id,
-        action,
-        entity_type,
-        entity_id,
-        description,
-        ip_address,
-        user_agent
-      )
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [
-      context.organizationId,
-      context.branchId,
-      context.userId,
-      entry.action,
-      entry.entityType,
-      entry.entityId,
-      entry.description,
-      req.ip || null,
-      req.get('user-agent') ? req.get('user-agent').substring(0, 500) : null,
-    ]
-  );
-};
+const audit = writeAuditLog;
 
 const getErrorResponse = (res, error, fallbackCode, fallbackMessage) => {
   if (error instanceof FitnessHttpError) {
@@ -439,11 +424,29 @@ const createAssessment = async (req, res) => {
       [context.organizationId, context.memberId, progressId]
     );
 
+    const recordedFields = [
+      'measurement_date',
+      ...METRIC_FIELDS.filter((field) => values[field] !== null),
+      ...(values.bmi !== null && values.bmi !== undefined ? ['bmi'] : []),
+      ...(values.notes ? ['notes'] : []),
+    ];
+
     await audit(connection, req, context, {
       action: 'MEMBER_FITNESS_CREATED',
       entityType: 'member_fitness_progress',
       entityId: progressId,
-      description: `Created fitness assessment for member ${member.member_code}; measurement_date=${values.measurement_date}; recorded_fields=${METRIC_FIELDS.filter((field) => values[field] !== null).join(',') || 'notes_only'}. Measurement values and notes intentionally omitted from audit description.`,
+      description: `Created fitness assessment ${progressId} for member ${member.member_code}; recorded_fields=${recordedFields.join(',')}. Measurement values and notes are excluded.`,
+      oldValues: { record_exists: false },
+      newValues: {
+        record_exists: true,
+        recorded_fields: recordedFields,
+      },
+      metadata: buildMemberAuditMetadata(member, {
+        fitness_assessment: {
+          progress_id: progressId,
+          assessment_branch_id: Number(rows[0].branch_id),
+        },
+      }),
     });
 
     await connection.commit();
@@ -533,7 +536,21 @@ const updateAssessment = async (req, res) => {
       action: 'MEMBER_FITNESS_UPDATED',
       entityType: 'member_fitness_progress',
       entityId: progressId,
-      description: `Updated fitness assessment ${progressId} for member ${member.member_code}; changed_fields=${changedFields.join(',') || 'none'}. Previous/new measurement values and notes intentionally omitted from audit description.`,
+      description: `Updated fitness assessment ${progressId} for member ${member.member_code}; changed_fields=${changedFields.join(',') || 'none'}. Measurement values and notes are excluded.`,
+      oldValues: {
+        record_exists: true,
+        changed_fields: changedFields,
+      },
+      newValues: {
+        record_exists: true,
+        changed_fields: changedFields,
+      },
+      metadata: buildMemberAuditMetadata(member, {
+        fitness_assessment: {
+          progress_id: progressId,
+          assessment_branch_id: Number(current.branch_id),
+        },
+      }),
     });
 
     await connection.commit();
@@ -573,7 +590,7 @@ const deleteAssessment = async (req, res) => {
     transactionStarted = true;
 
     const member = await ensureMember(connection, context, true);
-    await ensureAssessment(connection, context, progressId, true);
+    const assessment = await ensureAssessment(connection, context, progressId, true);
 
     const [photos] = await connection.query(
       `SELECT id, photo_type, storage_path
@@ -603,7 +620,18 @@ const deleteAssessment = async (req, res) => {
       action: 'MEMBER_FITNESS_DELETED',
       entityType: 'member_fitness_progress',
       entityId: progressId,
-      description: `Deleted fitness assessment ${progressId} for member ${member.member_code}; removed_photo_slots=${photos.map((row) => row.photo_type).join(',') || 'none'}.`,
+      description: `Deleted fitness assessment ${progressId} for member ${member.member_code}.`,
+      oldValues: {
+        record_exists: true,
+        photo_slots: photos.map((row) => row.photo_type),
+      },
+      newValues: { record_exists: false },
+      metadata: buildMemberAuditMetadata(member, {
+        fitness_assessment: {
+          progress_id: progressId,
+          assessment_branch_id: Number(assessment.branch_id),
+        },
+      }),
     });
 
     await connection.commit();
@@ -764,8 +792,8 @@ const uploadAssessmentPhoto = async (req, res) => {
     await connection.beginTransaction();
     transactionStarted = true;
 
-    await ensureMember(connection, context, true);
-    await ensureAssessment(connection, context, progressId, true);
+    const member = await ensureMember(connection, context, true);
+    const assessment = await ensureAssessment(connection, context, progressId, true);
 
     const [existingRows] = await connection.query(
       `SELECT id, storage_path
@@ -813,7 +841,23 @@ const uploadAssessmentPhoto = async (req, res) => {
       action: oldPhotoPath ? 'MEMBER_FITNESS_PHOTO_REPLACED' : 'MEMBER_FITNESS_PHOTO_UPLOADED',
       entityType: 'member_fitness_photo',
       entityId: Number(photoRows[0].id),
-      description: `${oldPhotoPath ? 'Replaced' : 'Uploaded'} ${photoType} photo for fitness assessment ${progressId}; format=webp; width=${processed.width}; height=${processed.height}; size_bytes=${processed.sizeBytes}.`,
+      description: `${oldPhotoPath ? 'Replaced' : 'Uploaded'} ${photoType} photo for fitness assessment ${progressId}.`,
+      oldValues: { has_photo: Boolean(oldPhotoPath) },
+      newValues: { has_photo: true },
+      metadata: buildMemberAuditMetadata(member, {
+        fitness_assessment: {
+          progress_id: progressId,
+          assessment_branch_id: Number(assessment.branch_id),
+        },
+        fitness_photo: {
+          photo_id: Number(photoRows[0].id),
+          photo_type: photoType,
+          format: processed.format,
+          width: processed.width,
+          height: processed.height,
+          size_bytes: processed.sizeBytes,
+        },
+      }),
     });
 
     await connection.commit();
@@ -902,8 +946,8 @@ const deleteAssessmentPhoto = async (req, res) => {
     await connection.beginTransaction();
     transactionStarted = true;
 
-    await ensureMember(connection, context, true);
-    await ensureAssessment(connection, context, progressId, true);
+    const member = await ensureMember(connection, context, true);
+    const assessment = await ensureAssessment(connection, context, progressId, true);
 
     const [rows] = await connection.query(
       `SELECT id, storage_path
@@ -928,6 +972,18 @@ const deleteAssessmentPhoto = async (req, res) => {
       entityType: 'member_fitness_photo',
       entityId: Number(rows[0].id),
       description: `Deleted ${photoType} photo from fitness assessment ${progressId}.`,
+      oldValues: { has_photo: true },
+      newValues: { has_photo: false },
+      metadata: buildMemberAuditMetadata(member, {
+        fitness_assessment: {
+          progress_id: progressId,
+          assessment_branch_id: Number(assessment.branch_id),
+        },
+        fitness_photo: {
+          photo_id: Number(rows[0].id),
+          photo_type: photoType,
+        },
+      }),
     });
 
     await connection.commit();

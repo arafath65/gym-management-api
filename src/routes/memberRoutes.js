@@ -1,8 +1,10 @@
-'use strict';
+﻿'use strict';
 
 const express = require('express');
 
 const memberFitnessRoutes = require('./memberFitnessRoutes');
+const memberProgramRoutes = require('./memberProgramRoutes');
+const memberMembershipRoutes = require('./memberMembershipRoutes');
 
 const {
   authenticateDevice,
@@ -85,7 +87,7 @@ router.post(
   createMember
 );
 
-// Member profiles are limited to the authenticated active branch.
+// Member profile access is organization-wide; registration branch is retained for reporting.
 router.get(
   '/:memberId/photo',
   requireGymPermission('members.view'),
@@ -101,7 +103,7 @@ router.post(
 
 router.get(
   '/:memberId',
-  requireGymPermission('members.update'),
+  requireGymPermission('members.view'),
   getMember
 );
 
@@ -124,5 +126,7 @@ router.post(
 );
 
 router.use('/:memberId/fitness', memberFitnessRoutes);
+router.use('/:memberId/programs', memberProgramRoutes);
+router.use('/:memberId/memberships', memberMembershipRoutes);
 
 module.exports = router;

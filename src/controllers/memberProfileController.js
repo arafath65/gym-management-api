@@ -2,6 +2,11 @@
 
 const db = require('../config/db');
 const {
+  writeAuditLog,
+  buildMemberAuditMetadata,
+  buildMemberProfileSnapshots,
+} = require('../services/gymAuditService');
+const {
   normalizeSriLankanPhone,
   parseSriLankanNic,
   encryptSriLankanNic,
@@ -144,11 +149,10 @@ const getMemberRow = async (executor, context, memberId, forUpdate = false) => {
        ON b.organization_id = m.organization_id
       AND b.id = m.registration_branch_id
      WHERE m.organization_id = ?
-       AND m.registration_branch_id = ?
        AND m.id = ?
      LIMIT 1
      ${forUpdate ? 'FOR UPDATE' : ''}`,
-    [context.organizationId, context.branchId, memberId]
+    [context.organizationId, memberId]
   );
 
   return rows[0] || null;
@@ -193,30 +197,12 @@ const toMemberResponse = (row, { includeNic = false } = {}) => ({
   updated_at: row.updated_at,
 });
 
-const writeMemberAudit = async (connection, req, context, memberId, action, description) => {
-  const userAgent = req.get('user-agent');
-  await connection.query(
-    `INSERT INTO audit_logs
-       (organization_id, branch_id, user_id, action, entity_type,
-        entity_id, description, ip_address, user_agent)
-     VALUES (?, ?, ?, ?, 'member', ?, ?, ?, ?)`,
-    [
-      context.organizationId,
-      context.branchId,
-      context.userId,
-      action,
-      memberId,
-      description,
-      req.ip || null,
-      userAgent ? userAgent.substring(0, 500) : null,
-    ]
-  );
-};
+const writeMemberAudit = writeAuditLog;
 
 const respondMemberNotFound = (res) => res.status(404).json({
   success: false,
   code: 'MEMBER_NOT_FOUND',
-  message: 'Member not found in the active branch.',
+  message: 'Member not found.',
 });
 
 const getMember = async (req, res) => {
@@ -558,8 +544,7 @@ const updateMember = async (req, res) => {
            admission_fee_status = ?,
            updated_by_user_id = ?
        WHERE organization_id = ?
-         AND registration_branch_id = ?
-         AND id = ?`,
+          AND id = ?`,
       [
         nicFields.nic_type,
         nicFields.nic_ciphertext,
@@ -591,23 +576,24 @@ const updateMember = async (req, res) => {
         admissionFeeStatus,
         admissionFeeStatus,
         context.userId,
-        context.organizationId,
-        context.branchId,
-        memberId,
+        context.organizationId, memberId,
       ]
     );
 
     const updatedRow = await getMemberRow(connection, context, memberId);
     if (!updatedRow) throw new Error('Updated member could not be reloaded.');
 
-    await writeMemberAudit(
-      connection,
-      req,
-      context,
-      memberId,
-      'MEMBER_UPDATED',
-      `Updated member ${updatedRow.member_code}.`
-    );
+    const auditSnapshots = buildMemberProfileSnapshots(oldRow, updatedRow);
+
+    await writeMemberAudit(connection, req, context, {
+      action: 'MEMBER_UPDATED',
+      entityType: 'member',
+      entityId: memberId,
+      description: `Updated member ${updatedRow.member_code}; changed_fields=${auditSnapshots.changedFields.join(',') || 'none'}. Sensitive personal values are excluded.`,
+      oldValues: auditSnapshots.oldValues,
+      newValues: auditSnapshots.newValues,
+      metadata: buildMemberAuditMetadata(updatedRow),
+    });
 
     await connection.commit();
     transactionStarted = false;
@@ -705,20 +691,20 @@ const changeMemberStatus = async (req, res, targetStatus) => {
       `UPDATE members
        SET status = ?, updated_by_user_id = ?
        WHERE organization_id = ?
-         AND registration_branch_id = ?
          AND id = ?`,
-      [targetStatus, context.userId, context.organizationId, context.branchId, memberId]
+      [targetStatus, context.userId, context.organizationId, memberId]
     );
 
     const updatedRow = await getMemberRow(connection, context, memberId);
-    await writeMemberAudit(
-      connection,
-      req,
-      context,
-      memberId,
-      targetStatus === 'inactive' ? 'MEMBER_DEACTIVATED' : 'MEMBER_REACTIVATED',
-      `${targetStatus === 'inactive' ? 'Deactivated' : 'Reactivated'} member ${row.member_code}.`
-    );
+    await writeMemberAudit(connection, req, context, {
+      action: targetStatus === 'inactive' ? 'MEMBER_DEACTIVATED' : 'MEMBER_REACTIVATED',
+      entityType: 'member',
+      entityId: memberId,
+      description: `${targetStatus === 'inactive' ? 'Deactivated' : 'Reactivated'} member ${row.member_code}.`,
+      oldValues: { status: row.status },
+      newValues: { status: updatedRow.status },
+      metadata: buildMemberAuditMetadata(row),
+    });
 
     await connection.commit();
     transactionStarted = false;
@@ -862,19 +848,26 @@ const uploadMemberPhoto = async (req, res) => {
       `UPDATE members
        SET profile_photo_path = ?, updated_by_user_id = ?
        WHERE organization_id = ?
-         AND registration_branch_id = ?
          AND id = ?`,
-      [newPhotoPath, context.userId, context.organizationId, context.branchId, memberId]
+      [newPhotoPath, context.userId, context.organizationId, memberId]
     );
 
-    await writeMemberAudit(
-      connection,
-      req,
-      context,
-      memberId,
-      'MEMBER_PHOTO_UPDATED',
-      `Updated profile photo for member ${row.member_code}.`
-    );
+    await writeMemberAudit(connection, req, context, {
+      action: 'MEMBER_PHOTO_UPDATED',
+      entityType: 'member',
+      entityId: memberId,
+      description: `Updated profile photo for member ${row.member_code}.`,
+      oldValues: { has_profile_photo: Boolean(oldPhotoPath) },
+      newValues: { has_profile_photo: true },
+      metadata: buildMemberAuditMetadata(row, {
+        profile_photo: {
+          format: processed.format,
+          width: processed.width,
+          height: processed.height,
+          size_bytes: processed.sizeBytes,
+        },
+      }),
+    });
 
     await connection.commit();
     transactionStarted = false;
