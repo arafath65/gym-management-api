@@ -1,4 +1,4 @@
-﻿'use strict';
+'use strict';
 
 const db = require('../config/db');
 
@@ -193,6 +193,14 @@ const getInvoicePeriod = async (
   membership,
   today
 ) => {
+  if (membership.status === 'suspended') {
+    throw new BillingError(
+      409,
+      'SUSPENDED_MEMBERSHIP_CANNOT_BE_INVOICED',
+      'A suspended membership cannot receive a new invoice. Reactivate it first.'
+    );
+  }
+
   if (membership.status === 'cancelled') {
     throw new BillingError(
       409,
@@ -281,11 +289,21 @@ const getInvoicePeriod = async (
   let periodEndExclusive;
 
   if (latestRows.length) {
-    periodStart = await shiftDate(
+    const nextStartAfterLatestInvoice = await shiftDate(
       connection,
       latestRows[0].last_period_end,
       1
     );
+
+    // Reactivation may advance next_billing_date to skip
+    // billing anniversaries that occurred during suspension.
+    const scheduledNextBillingDate = membership.next_billing_date;
+
+    periodStart =
+      scheduledNextBillingDate &&
+      scheduledNextBillingDate > nextStartAfterLatestInvoice
+        ? scheduledNextBillingDate
+        : nextStartAfterLatestInvoice;
 
     if (periodStart > today) {
       throw new BillingError(
@@ -302,15 +320,44 @@ const getInvoicePeriod = async (
       intervalUnit
     );
   } else {
-    periodStart = membership.start_date;
+    // No previous invoice exists. Preserve the original first
+    // billing period unless reactivation advanced its boundary.
+    const originalFirstBillingBoundary = await addBillingInterval(
+      connection,
+      membership.start_date,
+      intervalValue,
+      intervalUnit
+    );
 
-    periodEndExclusive = membership.next_billing_date ||
-      await addBillingInterval(
+    const storedNextBillingDate =
+      membership.next_billing_date ||
+      originalFirstBillingBoundary;
+
+    if (storedNextBillingDate > originalFirstBillingBoundary) {
+      // First invoice is being generated after a suspension.
+      // Start at the resumed billing anniversary, not membership
+      // start_date, so suspended periods are not charged.
+      periodStart = storedNextBillingDate;
+
+      if (periodStart > today) {
+        throw new BillingError(
+          409,
+          'NEXT_BILLING_PERIOD_NOT_DUE',
+          `The next billing period starts on ${periodStart}.`
+        );
+      }
+
+      periodEndExclusive = await addBillingInterval(
         connection,
         periodStart,
         intervalValue,
         intervalUnit
       );
+    } else {
+      // Normal first invoice: retain the original billing period.
+      periodStart = membership.start_date;
+      periodEndExclusive = storedNextBillingDate;
+    }
   }
 
   if (periodEndExclusive <= periodStart) {
@@ -505,6 +552,9 @@ const invoiceSummarySql = `
     COALESCE(ledger.refunded_amount, 0.00)
       AS refunded_amount,
 
+    COALESCE(waiver_ledger.waived_amount, 0.00)
+      AS waived_amount,
+
     GREATEST(
       COALESCE(ledger.allocated_amount, 0.00) -
       COALESCE(ledger.refunded_amount, 0.00),
@@ -513,24 +563,57 @@ const invoiceSummarySql = `
 
     GREATEST(
       i.total_amount -
-      (
+      GREATEST(
         COALESCE(ledger.allocated_amount, 0.00) -
-        COALESCE(ledger.refunded_amount, 0.00)
-      ),
+        COALESCE(ledger.refunded_amount, 0.00),
+        0.00
+      ) -
+      COALESCE(waiver_ledger.waived_amount, 0.00),
       0.00
     ) AS balance_due,
 
     CASE
       WHEN i.total_amount = 0 THEN 'paid'
-      WHEN (
+
+      WHEN GREATEST(
         COALESCE(ledger.allocated_amount, 0.00) -
-        COALESCE(ledger.refunded_amount, 0.00)
-      ) <= 0 THEN 'unpaid'
-      WHEN (
-        COALESCE(ledger.allocated_amount, 0.00) -
-        COALESCE(ledger.refunded_amount, 0.00)
+        COALESCE(ledger.refunded_amount, 0.00),
+        0.00
       ) >= i.total_amount THEN 'paid'
-      ELSE 'partially_paid'
+
+      WHEN (
+        GREATEST(
+          COALESCE(ledger.allocated_amount, 0.00) -
+          COALESCE(ledger.refunded_amount, 0.00),
+          0.00
+        ) +
+        COALESCE(waiver_ledger.waived_amount, 0.00)
+      ) >= i.total_amount THEN
+        CASE
+          WHEN
+            COALESCE(waiver_ledger.waived_amount, 0.00) > 0
+            AND GREATEST(
+              COALESCE(ledger.allocated_amount, 0.00) -
+              COALESCE(ledger.refunded_amount, 0.00),
+              0.00
+            ) > 0
+            THEN 'settled'
+          WHEN COALESCE(waiver_ledger.waived_amount, 0.00)
+            >= i.total_amount
+            THEN 'waived'
+          ELSE 'paid'
+        END
+
+      WHEN GREATEST(
+        COALESCE(ledger.allocated_amount, 0.00) -
+        COALESCE(ledger.refunded_amount, 0.00),
+        0.00
+      ) > 0 THEN 'partially_paid'
+
+      WHEN COALESCE(waiver_ledger.waived_amount, 0.00) > 0
+        THEN 'partially_waived'
+
+      ELSE 'unpaid'
     END AS payment_status,
 
     CASE
@@ -539,10 +622,12 @@ const invoiceSummarySql = `
        AND i.due_date < CURRENT_DATE()
        AND GREATEST(
          i.total_amount -
-         (
+         GREATEST(
            COALESCE(ledger.allocated_amount, 0.00) -
-           COALESCE(ledger.refunded_amount, 0.00)
-         ),
+           COALESCE(ledger.refunded_amount, 0.00),
+           0.00
+         ) -
+         COALESCE(waiver_ledger.waived_amount, 0.00),
          0.00
        ) > 0
       THEN 1
@@ -586,6 +671,18 @@ const invoiceSummarySql = `
   ) ledger
     ON ledger.organization_id = i.organization_id
    AND ledger.invoice_id = i.id
+
+  LEFT JOIN (
+    SELECT
+      organization_id,
+      invoice_id,
+      SUM(waiver_amount) AS waived_amount
+    FROM member_membership_invoice_waivers
+    WHERE status = 'posted'
+    GROUP BY organization_id, invoice_id
+  ) waiver_ledger
+    ON waiver_ledger.organization_id = i.organization_id
+   AND waiver_ledger.invoice_id = i.id
 `;
 
 const serializeInvoice = (row) => ({
@@ -614,6 +711,7 @@ const serializeInvoice = (row) => ({
 
   allocated_amount: String(row.allocated_amount),
   refunded_amount: String(row.refunded_amount),
+  waived_amount: String(row.waived_amount),
   net_paid: String(row.net_paid),
   balance_due: String(row.balance_due),
 
@@ -1066,6 +1164,24 @@ const voidMembershipInvoice = async (req, res) => {
         409,
         'MEMBERSHIP_INVOICE_HAS_POSTED_REFUNDS',
         'This invoice has posted refunds and cannot be voided.'
+      );
+    }
+
+    // Posted waivers must be reversed before invoice voiding.
+    const [waiverRows] = await connection.query(
+      `SELECT COUNT(*) AS total
+       FROM member_membership_invoice_waivers
+       WHERE organization_id = ?
+         AND invoice_id = ?
+         AND status = 'posted'`,
+      [context.organizationId, invoiceId]
+    );
+
+    if (Number(waiverRows[0]?.total || 0) > 0) {
+      throw new BillingError(
+        409,
+        'MEMBERSHIP_INVOICE_HAS_POSTED_WAIVERS',
+        'This invoice has posted waivers. Void the posted waivers before voiding the invoice.'
       );
     }
 

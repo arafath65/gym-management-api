@@ -1,4 +1,4 @@
-﻿'use strict';
+'use strict';
 
 const db = require('../config/db');
 
@@ -286,12 +286,27 @@ const getInvoiceBalance = async (
            INNER JOIN member_membership_payment_allocations a
              ON a.organization_id = r.organization_id
             AND a.id = r.payment_allocation_id
+           INNER JOIN member_membership_payments p
+             ON p.organization_id = a.organization_id
+            AND p.id = a.payment_id
+            AND p.status = 'posted'
            WHERE r.organization_id = i.organization_id
              AND a.invoice_id = i.id
              AND r.status = 'posted'
          ),
          0.00
-       ) AS refunded_amount
+       ) AS refunded_amount,
+
+       COALESCE(
+         (
+           SELECT SUM(w.waiver_amount)
+           FROM member_membership_invoice_waivers w
+           WHERE w.organization_id = i.organization_id
+             AND w.invoice_id = i.id
+             AND w.status = 'posted'
+         ),
+         0.00
+       ) AS waived_amount
 
      FROM member_membership_invoices i
      WHERE i.organization_id = ?
@@ -311,25 +326,37 @@ const getInvoiceBalance = async (
   const total = decimalToCents(rows[0].total_amount);
   const allocated = decimalToCents(rows[0].allocated_amount);
   const refunded = decimalToCents(rows[0].refunded_amount);
+  const waived = decimalToCents(rows[0].waived_amount);
 
   const rawNetPaid = allocated - refunded;
   const netPaid = rawNetPaid > 0n ? rawNetPaid : 0n;
 
-  const rawBalance = total - rawNetPaid;
+  const rawBalance = total - netPaid - waived;
   const balanceDue = rawBalance > 0n ? rawBalance : 0n;
 
   let paymentStatus = 'unpaid';
 
   if (total === 0n || netPaid >= total) {
     paymentStatus = 'paid';
+  } else if (balanceDue === 0n) {
+    if (netPaid > 0n && waived > 0n) {
+      paymentStatus = 'settled';
+    } else if (waived > 0n) {
+      paymentStatus = 'waived';
+    } else {
+      paymentStatus = 'paid';
+    }
   } else if (netPaid > 0n) {
     paymentStatus = 'partially_paid';
+  } else if (waived > 0n) {
+    paymentStatus = 'partially_waived';
   }
 
   return {
     total_amount: centsToDecimal(total),
     allocated_amount: centsToDecimal(allocated),
     refunded_amount: centsToDecimal(refunded),
+    waived_amount: centsToDecimal(waived),
     net_paid: centsToDecimal(netPaid),
     balance_due: centsToDecimal(balanceDue),
     payment_status: paymentStatus,
@@ -337,6 +364,7 @@ const getInvoiceBalance = async (
     totalCents: total,
     allocatedCents: allocated,
     refundedCents: refunded,
+    waivedCents: waived,
     balanceCents: balanceDue,
   };
 };

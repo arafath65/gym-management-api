@@ -1,4 +1,4 @@
-﻿'use strict';
+'use strict';
 
 const db = require('../config/db');
 const {
@@ -672,6 +672,7 @@ const listMemberMemberships = async (req, res) => {
       'active',
       'scheduled',
       'expired',
+      'suspended',
       'cancelled',
     ]);
 
@@ -707,6 +708,11 @@ const listMemberMemberships = async (req, res) => {
 
       filters.push(`${statusExpression} = ?`);
       params.push(req.query.status);
+
+      // Ended couple participants must not see this as a current membership.
+      if (req.query.status === 'active') {
+        filters.push("mm.status = 'active'");
+      }
     }
 
     await ensureMemberExists(db, context);
@@ -1535,6 +1541,9 @@ const cancelMemberMembership = async (req, res) => {
        SET status = 'cancelled',
            cancelled_on = CURRENT_DATE(),
            cancellation_reason = ?,
+           suspended_at = NULL,
+           suspended_by_user_id = NULL,
+           suspension_reason = NULL,
            updated_by_user_id = ?
        WHERE organization_id = ?
          AND id = ?`,

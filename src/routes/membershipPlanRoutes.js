@@ -18,11 +18,22 @@ const {
   reactivateMembershipPlan,
 } = require("../controllers/membershipPlanController");
 
+const {
+  getMembershipPlanCollections,
+} = require("../controllers/memberBillingCollectionsController");
+
 const router = express.Router();
 
-// All membership-plan endpoints require a valid organization device
-// and a valid Gym Staff session.
 router.use(authenticateDevice, authenticateGymStaff);
+
+// Static route must be before /:planId.
+router.get(
+  "/collections",
+  requireGymPermission("membership_plans.view"),
+  requireGymPermission("member_billing.dashboard.view"),
+  requireGymPermission("member_billing.reports.view"),
+  getMembershipPlanCollections
+);
 
 router.get(
   "/",

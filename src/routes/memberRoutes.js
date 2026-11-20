@@ -1,10 +1,12 @@
-﻿'use strict';
+'use strict';
 
 const express = require('express');
 
 const memberFitnessRoutes = require('./memberFitnessRoutes');
 const memberProgramRoutes = require('./memberProgramRoutes');
 const memberMembershipRoutes = require('./memberMembershipRoutes');
+const memberBillingRoutes = require('./memberBillingRoutes');
+const memberBillingAccountRoutes = require('./memberBillingAccountRoutes');
 
 const {
   authenticateDevice,
@@ -69,6 +71,7 @@ const parseMemberPhoto = (req, res, next) => {
 const router = express.Router();
 
 router.use(authenticateDevice, authenticateGymStaff);
+router.use('/billing', memberBillingRoutes);
 router.get(
   '/',
   requireGymPermission('members.view'),
@@ -128,5 +131,6 @@ router.post(
 router.use('/:memberId/fitness', memberFitnessRoutes);
 router.use('/:memberId/programs', memberProgramRoutes);
 router.use('/:memberId/memberships', memberMembershipRoutes);
+router.use('/:memberId/billing', memberBillingAccountRoutes);
 
 module.exports = router;
