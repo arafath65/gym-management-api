@@ -14,6 +14,23 @@ const {
   renewMemberMembership,
 } = require('../controllers/memberMembershipController');
 
+const {
+  listMembershipInvoices,
+  createMembershipInvoice,
+  voidMembershipInvoice,
+} = require('../controllers/memberMembershipInvoiceController');
+const {
+  listMemberInvoicePayments,
+  receiveMemberInvoicePayment,
+  voidMemberInvoicePayment,
+} = require('../controllers/memberMembershipPaymentController');
+const {
+  listMemberPaymentRefunds,
+  createMemberPaymentRefund,
+  voidMemberPaymentRefund,
+} = require('../controllers/memberMembershipRefundController');
+
+
 const router = express.Router({ mergeParams: true });
 
 router.get(
@@ -46,4 +63,58 @@ router.post(
   renewMemberMembership
 );
 
+router.get(
+  '/:membershipId/invoices',
+  requireGymPermission('member_billing.view'),
+  listMembershipInvoices
+);
+
+router.post(
+  '/:membershipId/invoices',
+  requireGymPermission('member_billing.invoices.create'),
+  createMembershipInvoice
+);
+router.post(
+  '/:membershipId/invoices/:invoiceId/void',
+  requireGymPermission('member_billing.invoices.void'),
+  voidMembershipInvoice
+);
+router.get(
+  '/:membershipId/invoices/:invoiceId/payments',
+  requireGymPermission('member_billing.view'),
+  listMemberInvoicePayments
+);
+
+router.post(
+  '/:membershipId/invoices/:invoiceId/payments',
+  requireGymPermission('member_billing.payments.receive'),
+  receiveMemberInvoicePayment
+);
+router.post(
+  '/:membershipId/invoices/:invoiceId/payments/:paymentId/void',
+  requireGymPermission('member_billing.payments.void'),
+  voidMemberInvoicePayment
+);
+router.get(
+  '/:membershipId/invoices/:invoiceId/payments/:paymentId/refunds',
+  requireGymPermission('member_billing.view'),
+  listMemberPaymentRefunds
+);
+
+router.post(
+  '/:membershipId/invoices/:invoiceId/payments/:paymentId/refunds',
+  requireGymPermission('member_billing.refunds.manage'),
+  createMemberPaymentRefund
+);
+
+router.post(
+  '/:membershipId/invoices/:invoiceId/payments/:paymentId/refunds/:refundId/void',
+  requireGymPermission('member_billing.refunds.manage'),
+  voidMemberPaymentRefund
+);
 module.exports = router;
+
+
+
+
+
