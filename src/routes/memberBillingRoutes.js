@@ -14,6 +14,7 @@ const {
 
 const {
   getCollectionsSummary,
+  getProgramAssignmentReport,
 } = require('../controllers/memberBillingCollectionsController');
 
 const {
@@ -44,6 +45,13 @@ const requireBillingMemberSearchPermission = (req, res, next) => {
 };
 
 const router = express.Router();
+
+router.get(
+  '/program-assignments',
+  requireGymPermission('member_billing.reports.view'),
+  requireGymPermission('member_programs.view'),
+  getProgramAssignmentReport
+);
 
 router.get(
   '/member-search',

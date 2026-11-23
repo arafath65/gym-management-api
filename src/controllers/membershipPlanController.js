@@ -6,11 +6,15 @@ const parsePositiveId = (value) => {
 };
 
 const ALLOWED_INPUT_FIELDS = new Set([
+  "plan_category",
+  "program_category",
+  "instructions",
   "name",
   "description",
   "package_type",
   "tier",
   "validity_type",
+  "billing_mode",
   "duration_value",
   "duration_unit",
   "billing_interval_value",
@@ -22,11 +26,15 @@ const ALLOWED_INPUT_FIELDS = new Set([
 ]);
 
 const FIELD_COLUMNS = {
+  plan_category: "plan_category",
+  program_category: "program_category",
+  instructions: "instructions",
   name: "name",
   description: "description",
   package_type: "package_type",
   tier: "tier",
   validity_type: "validity_type",
+  billing_mode: "billing_mode",
   duration_value: "duration_value",
   duration_unit: "duration_unit",
   billing_interval_value: "billing_interval_value",
@@ -42,11 +50,17 @@ const PLAN_SELECT = `
     id,
     organization_id,
     plan_code,
+    plan_category,
+    program_category,
+    instructions,
+    legacy_program_id,
+    price_configured,
     name,
     description,
     package_type,
     tier,
     validity_type,
+    billing_mode,
     duration_value,
     duration_unit,
     billing_interval_value,
@@ -67,11 +81,17 @@ const getPlanResponse = (row) => ({
   id: Number(row.id),
   organization_id: Number(row.organization_id),
   plan_code: row.plan_code,
+  plan_category: row.plan_category || "membership",
+  program_category: row.program_category || null,
+  instructions: row.instructions || null,
+  legacy_program_id: row.legacy_program_id == null ? null : Number(row.legacy_program_id),
+  price_configured: Number(row.price_configured) === 1,
   name: row.name,
   description: row.description,
   package_type: row.package_type,
   tier: row.tier,
   validity_type: row.validity_type,
+  billing_mode: row.billing_mode || "standard",
   duration_value: row.duration_value == null ? null : Number(row.duration_value),
   duration_unit: row.duration_unit,
   billing_interval_value:
@@ -109,6 +129,27 @@ const validateAllowedFields = (body) => {
   return null;
 };
 
+const categoryPermission = (category, action) =>
+  category === 'program'
+    ? `fitness_programs.${action}`
+    : `membership_plans.${action}`;
+
+const canAccessCategory = (req, category, action) =>
+  (req.gymStaff?.permissions || []).includes(categoryPermission(category, action));
+
+const requireCategoryAccess = (req, res, category, action) => {
+  if (!canAccessCategory(req, category, action)) {
+    res.status(403).json({
+      success: false,
+      code: 'GYM_PERMISSION_DENIED',
+      message: 'You do not have permission to manage this plan category.',
+      required_permission: categoryPermission(category, action),
+    });
+    return false;
+  }
+  return true;
+};
+
 const parsePrice = (value) => {
   if (
     typeof value !== "string" &&
@@ -134,11 +175,15 @@ const normalizePlanInput = (body, existing = null) => {
   const defaultPayingMembers = 1;
 
   const values = {
+    plan_category: existing?.plan_category ?? body.plan_category ?? "membership",
+    program_category: existing?.program_category ?? null,
+    instructions: existing?.instructions ?? null,
     name: existing?.name ?? "",
     description: existing?.description ?? null,
     package_type: existing?.package_type ?? "individual",
     tier: existing?.tier ?? null,
     validity_type: existing?.validity_type ?? "fixed",
+    billing_mode: existing?.billing_mode ?? "standard",
     duration_value: existing?.duration_value ?? null,
     duration_unit: existing?.duration_unit ?? null,
     billing_interval_value: existing?.billing_interval_value ?? null,
@@ -150,6 +195,23 @@ const normalizePlanInput = (body, existing = null) => {
   };
 
   Object.assign(values, body);
+
+  if (!['membership', 'program'].includes(values.plan_category)) {
+    values.plan_category = 'membership';
+  }
+
+  // Program catalog entries are fixed-duration programs, not gym-access
+  // memberships. Keep their legacy fitness_programs mirror compatible.
+  if (values.plan_category === 'program') {
+    values.package_type = 'individual';
+    values.tier = null;
+    values.validity_type = 'fixed';
+    values.billing_mode = 'standard';
+    values.billing_interval_value = null;
+    values.billing_interval_unit = null;
+    values.included_members = 1;
+    values.paying_members = 1;
+  }
 
   // Automatically apply standard member coverage when changing package type.
   if (
@@ -170,6 +232,40 @@ const normalizePlanInput = (body, existing = null) => {
 
   const errors = [];
   const units = ["day", "week", "month", "year"];
+
+  if (!["standard", "attendance"].includes(values.billing_mode)) {
+    errors.push("Billing mode must be standard or attendance.");
+  }
+
+  // Pay-per-attendance is not a calendar subscription. Its invoices are
+  // created only by a successful attendance check-in.
+  if (values.billing_mode === "attendance") {
+    values.validity_type = "ongoing";
+    values.duration_value = null;
+    values.duration_unit = null;
+    values.billing_interval_value = 1;
+    values.billing_interval_unit = "day";
+  }
+
+  if (values.plan_category === 'program') {
+    if (typeof values.program_category !== 'string' || !values.program_category.trim() || values.program_category.trim().length > 80) {
+      errors.push('Program category is required (maximum 80 characters).');
+    } else {
+      values.program_category = values.program_category.trim();
+    }
+    if (values.instructions != null && values.instructions !== '') {
+      if (typeof values.instructions !== 'string' || values.instructions.length > 10000) {
+        errors.push('Program instructions must be text (maximum 10000 characters).');
+      } else {
+        values.instructions = values.instructions.trim() || null;
+      }
+    } else {
+      values.instructions = null;
+    }
+  } else {
+    values.program_category = null;
+    values.instructions = null;
+  }
 
   if (
     typeof values.name !== "string" ||
@@ -428,8 +524,39 @@ const getMembershipPlans = async (req, res) => {
       });
     }
 
+    const permissions = req.gymStaff?.permissions || [];
+    const permittedCategories = [];
+    if (permissions.includes('membership_plans.view')) permittedCategories.push('membership');
+    if (permissions.includes('fitness_programs.view')) permittedCategories.push('program');
+    if (permittedCategories.length === 0) {
+      return res.status(403).json({
+        success: false,
+        code: 'GYM_PERMISSION_DENIED',
+        message: 'You do not have permission to view plans or programs.',
+      });
+    }
+
+    const requestedCategory = req.query.plan_category;
+    if (requestedCategory !== undefined && !['membership', 'program'].includes(requestedCategory)) {
+      return res.status(400).json({ success: false, message: 'Invalid plan_category filter.' });
+    }
+    if (requestedCategory && !permittedCategories.includes(requestedCategory)) {
+      return res.status(403).json({
+        success: false,
+        code: 'GYM_PERMISSION_DENIED',
+        message: 'You do not have permission to view this plan category.',
+      });
+    }
+
     const filters = ["organization_id = ?"];
     const params = [organizationId];
+    if (requestedCategory) {
+      filters.push('plan_category = ?');
+      params.push(requestedCategory);
+    } else {
+      filters.push(`plan_category IN (${permittedCategories.map(() => '?').join(', ')})`);
+      params.push(...permittedCategories);
+    }
 
     if (req.query.status !== undefined) {
       if (!["active", "inactive"].includes(req.query.status)) {
@@ -491,8 +618,8 @@ const getMembershipPlans = async (req, res) => {
       }
 
       const search = `%${req.query.search.trim()}%`;
-      filters.push("(name LIKE ? OR plan_code LIKE ? OR tier LIKE ?)");
-      params.push(search, search, search);
+      filters.push("(name LIKE ? OR plan_code LIKE ? OR tier LIKE ? OR program_category LIKE ?)");
+      params.push(search, search, search, search);
     }
 
     const whereSql = `WHERE ${filters.join(" AND ")}`;
@@ -586,6 +713,7 @@ const getMembershipPlan = async (req, res) => {
         message: "Membership plan not found.",
       });
     }
+    if (!requireCategoryAccess(req, res, rows[0].plan_category || 'membership', 'view')) return;
 
     return res.json({
       success: true,
@@ -608,6 +736,11 @@ const createMembershipPlan = async (req, res) => {
     const organizationId = Number(req.gymStaff.organizationId);
     const userId = Number(req.gymStaff.userId);
     const body = req.body || {};
+    const planCategory = body.plan_category || 'membership';
+    if (!['membership', 'program'].includes(planCategory)) {
+      return res.status(400).json({ success: false, message: 'Invalid plan category.' });
+    }
+    if (!requireCategoryAccess(req, res, planCategory, 'create')) return;
 
     const unknownError = validateAllowedFields(body);
 
@@ -664,17 +797,19 @@ const createMembershipPlan = async (req, res) => {
 
     // Locking the organization row serializes plan-code generation
     // for concurrent plan creation requests within this organization.
-    const [sequenceRows] = await connection.query(
-      `SELECT
-         COALESCE(
-           MAX(CAST(SUBSTRING(plan_code, 4) AS UNSIGNED)),
-           0
-         ) + 1 AS next_number
-       FROM membership_plans
-       WHERE organization_id = ?
-         AND plan_code REGEXP '^MP-[0-9]+$'`,
-      [organizationId]
-    );
+    const [sequenceRows] = planCategory === 'program'
+      ? await connection.query(
+          `SELECT COALESCE(MAX(CAST(SUBSTRING(program_code, 4) AS UNSIGNED)), 0) + 1 AS next_number
+           FROM fitness_programs
+           WHERE organization_id = ? AND program_code REGEXP '^FP-[0-9]+$'`,
+          [organizationId]
+        )
+      : await connection.query(
+          `SELECT COALESCE(MAX(CAST(SUBSTRING(plan_code, 4) AS UNSIGNED)), 0) + 1 AS next_number
+           FROM membership_plans
+           WHERE organization_id = ? AND plan_code REGEXP '^MP-[0-9]+$'`,
+          [organizationId]
+        );
 
     const nextNumber = Number(sequenceRows[0].next_number);
 
@@ -682,18 +817,23 @@ const createMembershipPlan = async (req, res) => {
       throw new Error("Unable to generate membership plan code.");
     }
 
-    const planCode = `MP-${String(nextNumber).padStart(6, "0")}`;
+    const planCode = `${planCategory === 'program' ? 'FP' : 'MP'}-${String(nextNumber).padStart(6, "0")}`;
 
     const [insertResult] = await connection.query(
       `INSERT INTO membership_plans
         (
           organization_id,
           plan_code,
+          plan_category,
+          program_category,
+          instructions,
+          price_configured,
           name,
           description,
           package_type,
           tier,
           validity_type,
+          billing_mode,
           duration_value,
           duration_unit,
           billing_interval_value,
@@ -705,15 +845,20 @@ const createMembershipPlan = async (req, res) => {
           status,
           created_by_user_id
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)`,
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)`,
       [
         organizationId,
         planCode,
+        planCategory,
+        values.program_category,
+        values.instructions,
+        1,
         values.name,
         values.description,
         values.package_type,
         values.tier,
         values.validity_type,
+        values.billing_mode,
         values.duration_value,
         values.duration_unit,
         values.billing_interval_value,
@@ -727,6 +872,23 @@ const createMembershipPlan = async (req, res) => {
     );
 
     const planId = Number(insertResult.insertId);
+
+    if (planCategory === 'program') {
+      const [legacyInsert] = await connection.query(
+        `INSERT INTO fitness_programs
+          (organization_id, program_code, name, category, description,
+           duration_value, duration_unit, instructions, status, created_by_user_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)`,
+        [organizationId, planCode, values.name, values.program_category,
+         values.description, values.duration_value, values.duration_unit,
+         values.instructions, userId]
+      );
+      await connection.query(
+        `UPDATE membership_plans SET legacy_program_id = ?
+         WHERE organization_id = ? AND id = ?`,
+        [Number(legacyInsert.insertId), organizationId, planId]
+      );
+    }
 
     const [createdRows] = await connection.query(
       `${PLAN_SELECT}
@@ -827,6 +989,18 @@ const updateMembershipPlan = async (req, res) => {
     }
 
     const oldPlan = existingRows[0];
+    const planCategory = oldPlan.plan_category || 'membership';
+    if (!requireCategoryAccess(req, res, planCategory, 'update')) {
+      await connection.rollback();
+      transactionStarted = false;
+      return;
+    }
+    if (Object.prototype.hasOwnProperty.call(body, 'plan_category') && body.plan_category !== planCategory) {
+      return await rollbackAndReturn(
+        connection, res, 400, 'PLAN_CATEGORY_IMMUTABLE',
+        'A plan category cannot be changed after creation.'
+      );
+    }
     const { values, errors } = normalizePlanInput(body, oldPlan);
 
     if (errors.length > 0) {
@@ -845,6 +1019,27 @@ const updateMembershipPlan = async (req, res) => {
     for (const key of Object.keys(body)) {
       updates.push(`${FIELD_COLUMNS[key]} = ?`);
       params.push(values[key]);
+    }
+
+    // Switching a plan to attendance mode must persist the non-recurring
+    // attendance schedule fields, even when the client only sends billing_mode.
+    if (
+      Object.prototype.hasOwnProperty.call(body, "billing_mode") &&
+      values.billing_mode === "attendance"
+    ) {
+      for (const key of [
+        "validity_type",
+        "duration_value",
+        "duration_unit",
+        "billing_interval_value",
+        "billing_interval_unit",
+      ]) {
+        const column = FIELD_COLUMNS[key] + " = ?";
+        if (!updates.includes(column)) {
+          updates.push(column);
+          params.push(values[key]);
+        }
+      }
     }
 
     // Package-type changes must keep couple/individual coverage valid.
@@ -873,6 +1068,11 @@ const updateMembershipPlan = async (req, res) => {
       }
     }
 
+    if (Object.prototype.hasOwnProperty.call(body, 'price')) {
+      updates.push('price_configured = ?');
+      params.push(1);
+    }
+
     updates.push("updated_by_user_id = ?");
     params.push(userId, organizationId, planId);
 
@@ -882,6 +1082,18 @@ const updateMembershipPlan = async (req, res) => {
        WHERE organization_id = ? AND id = ?`,
       params
     );
+
+    if (planCategory === 'program' && oldPlan.legacy_program_id) {
+      await connection.query(
+        `UPDATE fitness_programs
+         SET name = ?, category = ?, description = ?, duration_value = ?,
+             duration_unit = ?, instructions = ?, updated_by_user_id = ?
+         WHERE organization_id = ? AND id = ?`,
+        [values.name, values.program_category, values.description,
+         values.duration_value, values.duration_unit, values.instructions,
+         userId, organizationId, oldPlan.legacy_program_id]
+      );
+    }
 
     const [updatedRows] = await connection.query(
       `${PLAN_SELECT}
@@ -966,6 +1178,12 @@ const changeMembershipPlanStatus = async (req, res, status) => {
     }
 
     const oldPlan = rows[0];
+    const planCategory = oldPlan.plan_category || 'membership';
+    if (!requireCategoryAccess(req, res, planCategory, status === 'inactive' ? 'deactivate' : 'update')) {
+      await connection.rollback();
+      transactionStarted = false;
+      return;
+    }
 
     if (oldPlan.status === status) {
       await connection.commit();
@@ -984,6 +1202,14 @@ const changeMembershipPlanStatus = async (req, res, status) => {
        WHERE organization_id = ? AND id = ?`,
       [status, userId, organizationId, planId]
     );
+
+    if (planCategory === 'program' && oldPlan.legacy_program_id) {
+      await connection.query(
+        `UPDATE fitness_programs SET status = ?, updated_by_user_id = ?
+         WHERE organization_id = ? AND id = ?`,
+        [status, userId, organizationId, oldPlan.legacy_program_id]
+      );
+    }
 
     const [updatedRows] = await connection.query(
       `${PLAN_SELECT}

@@ -27,6 +27,7 @@ const {
 const {
   listMemberInvoicePayments,
   receiveMemberInvoicePayment,
+  receiveMembershipPayment,
   voidMemberInvoicePayment,
 } = require('../controllers/memberMembershipPaymentController');
 const {
@@ -168,6 +169,12 @@ router.post(
   '/:membershipId/invoices/:invoiceId/waivers/:waiverId/void',
   requireGymPermission('member_billing.waivers.void'),
   voidMemberInvoiceWaiver
+);
+router.post(
+  '/:membershipId/payments',
+  requireGymPermission('member_billing.payments.receive'),
+  requireCardPaymentPermission,
+  receiveMembershipPayment
 );
 router.get(
   '/:membershipId/invoices/:invoiceId/payments',

@@ -1,4 +1,4 @@
-require("dotenv").config();
+﻿require("dotenv").config();
 
 const express = require("express");
 const cors = require("cors");
@@ -19,6 +19,8 @@ const gymRoleRoutes = require("./routes/gymRoleRoutes");
 const gymStaffRoutes = require("./routes/gymStaffRoutes");
 const trainerRoutes = require("./routes/trainerRoutes");
 const memberRoutes = require("./routes/memberRoutes");
+const attendanceRoutes = require("./routes/attendanceRoutes");
+const gymProfileRoutes = require('./routes/gymProfileRoutes');
 
 const app = express();
 
@@ -40,6 +42,8 @@ app.use("/api/gym-roles", gymRoleRoutes);
 app.use("/api/gym-staff", gymStaffRoutes);
 app.use("/api/trainers", trainerRoutes);
 app.use("/api/members", memberRoutes);
+app.use("/api/attendance", attendanceRoutes);
+app.use('/api/gym-profile', gymProfileRoutes);
 
 
 app.get("/", (req, res) => {

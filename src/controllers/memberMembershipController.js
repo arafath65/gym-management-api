@@ -2,6 +2,9 @@
 
 const db = require('../config/db');
 const {
+  issueInitialMembershipInvoice,
+} = require('./memberMembershipInvoiceController');
+const {
   writeAuditLog,
   buildMemberAuditMetadata,
 } = require('../services/gymAuditService');
@@ -239,6 +242,7 @@ const getPlan = async (
        id,
        organization_id,
        plan_code,
+       plan_category,
        name,
        package_type,
        validity_type,
@@ -246,6 +250,7 @@ const getPlan = async (
        duration_unit,
        billing_interval_value,
        billing_interval_unit,
+       billing_mode,
        price,
        currency_code,
        included_members,
@@ -266,6 +271,14 @@ const getPlan = async (
     );
   }
 
+  if ((rows[0].plan_category || 'membership') !== 'membership') {
+    throw new MembershipError(
+      409,
+      'PLAN_IS_NOT_A_MEMBERSHIP',
+      'Program catalog entries cannot be assigned as gym memberships.'
+    );
+  }
+
   if (rows[0].status !== 'active') {
     throw new MembershipError(
       409,
@@ -282,6 +295,16 @@ const calculateMembershipDates = async (
   plan,
   startDate
 ) => {
+  // Attendance-based memberships are not calendar subscriptions. Their only
+  // billable events are successful attendance check-ins, so they have no
+  // recurring next_billing_date.
+  if (plan.billing_mode === 'attendance') {
+    return {
+      endDate: null,
+      nextBillingDate: null,
+    };
+  }
+
   if (plan.validity_type === 'fixed') {
     const endDate = await addDateInterval(
       connection,
@@ -383,6 +406,7 @@ const membershipSelectSql = `
     m.plan_name_snapshot,
     m.package_type_snapshot,
     m.validity_type_snapshot,
+    m.billing_mode_snapshot,
 
     m.duration_value_snapshot,
     m.duration_unit_snapshot,
@@ -523,6 +547,7 @@ const serializeMembership = (row, participants = []) => ({
   plan_name: row.plan_name_snapshot,
   package_type: row.package_type_snapshot,
   validity_type: row.validity_type_snapshot,
+  billing_mode: row.billing_mode_snapshot || "standard",
 
   duration_value: row.duration_value_snapshot == null
     ? null
@@ -857,6 +882,7 @@ const createMembership = async (req, res, isRenewal) => {
     const [planPreviewRows] = await connection.query(
       `SELECT
          id,
+         plan_category,
          package_type,
          validity_type
        FROM membership_plans
@@ -875,6 +901,13 @@ const createMembership = async (req, res, isRenewal) => {
     }
 
     const preview = planPreviewRows[0];
+    if ((preview.plan_category || 'membership') !== 'membership') {
+      throw new MembershipError(
+        409,
+        'PLAN_IS_NOT_A_MEMBERSHIP',
+        'Fitness programs cannot be assigned as gym memberships.'
+      );
+    }
 
     if (preview.package_type === 'individual' && suppliedIncludedId) {
       throw new MembershipError(
@@ -1104,6 +1137,7 @@ const createMembership = async (req, res, isRenewal) => {
          plan_name_snapshot,
          package_type_snapshot,
          validity_type_snapshot,
+         billing_mode_snapshot,
 
          duration_value_snapshot,
          duration_unit_snapshot,
@@ -1127,7 +1161,7 @@ const createMembership = async (req, res, isRenewal) => {
        VALUES
        (
          ?, ?, ?, ?, ?,
-         ?, ?, ?, ?,
+         ?, ?, ?, ?, ?,
          ?, ?, ?, ?,
          ?, ?, ?, ?,
          ?, ?, ?, 'active', ?,
@@ -1144,6 +1178,7 @@ const createMembership = async (req, res, isRenewal) => {
         plan.name,
         plan.package_type,
         plan.validity_type,
+        plan.billing_mode || 'standard',
 
         plan.duration_value,
         plan.duration_unit,
@@ -1207,6 +1242,13 @@ const createMembership = async (req, res, isRenewal) => {
       );
     }
 
+    const initialInvoice = await issueInitialMembershipInvoice(
+      connection,
+      req,
+      context,
+      membershipId
+    );
+
     const action = isRenewal
       ? 'MEMBER_MEMBERSHIP_RENEWED'
       : 'MEMBER_MEMBERSHIP_ASSIGNED';
@@ -1232,6 +1274,7 @@ const createMembership = async (req, res, isRenewal) => {
           plan_code: plan.plan_code,
           package_type: plan.package_type,
           validity_type: plan.validity_type,
+          billing_mode: plan.billing_mode || 'standard',
           start_date: startDate,
           end_date: dates.endDate,
           next_billing_date: dates.nextBillingDate,
@@ -1265,6 +1308,14 @@ const createMembership = async (req, res, isRenewal) => {
         ? 'Membership renewed successfully.'
         : 'Membership assigned successfully.',
       membership,
+      initial_invoice: initialInvoice
+        ? {
+            id: initialInvoice.invoiceId,
+            invoice_number: initialInvoice.invoiceNumber,
+            billing_period_start: initialInvoice.billingPeriodStart,
+            billing_period_end: initialInvoice.billingPeriodEnd,
+          }
+        : null,
     });
   } catch (error) {
     if (connection && transactionStarted) {

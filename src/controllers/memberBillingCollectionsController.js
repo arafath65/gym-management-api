@@ -2,6 +2,9 @@
 
 const db = require('../config/db');
 const { writeAuditLog } = require('../services/gymAuditService');
+const {
+  ensureDueMembershipInvoicesForBranch,
+} = require('./memberMembershipInvoiceController');
 
 class CollectionsError extends Error {
   constructor(status, code, message) {
@@ -212,6 +215,14 @@ const getCollectionsSummary = (req, res) => withAuditedRead(
   async (connection, context) => {
     const orgId = context.organizationId;
 
+    // Catch up recurring invoices due for this registration branch before
+    // calculating billed, collected and outstanding totals.
+    await ensureDueMembershipInvoicesForBranch(
+      connection,
+      req,
+      context
+    );
+
     // Count memberships, not individual couple participants.
     const [activeRows] = await connection.query(
       `SELECT COUNT(*) AS active_memberships
@@ -393,12 +404,69 @@ const [invoiceRows] = await connection.query(
   }
 );
 
+const OUTSTANDING_INVOICE_EXISTS = `EXISTS (
+    SELECT 1
+    FROM member_membership_invoices due_invoice
+    WHERE due_invoice.organization_id = m.organization_id
+      AND due_invoice.membership_id = m.id
+      AND due_invoice.status = 'issued'
+      AND GREATEST(
+        due_invoice.total_amount
+        - GREATEST(
+            COALESCE((
+              SELECT SUM(due_allocation.allocated_amount)
+              FROM member_membership_payment_allocations due_allocation
+              INNER JOIN member_membership_payments due_payment
+                ON due_payment.organization_id = due_allocation.organization_id
+               AND due_payment.id = due_allocation.payment_id
+               AND due_payment.status = 'posted'
+              WHERE due_allocation.organization_id = due_invoice.organization_id
+                AND due_allocation.invoice_id = due_invoice.id
+            ), 0.00)
+            - COALESCE((
+              SELECT SUM(due_refund.refund_amount)
+              FROM member_membership_refunds due_refund
+              INNER JOIN member_membership_payment_allocations refund_allocation
+                ON refund_allocation.organization_id = due_refund.organization_id
+               AND refund_allocation.id = due_refund.payment_allocation_id
+              INNER JOIN member_membership_payments refund_payment
+                ON refund_payment.organization_id = refund_allocation.organization_id
+               AND refund_payment.id = refund_allocation.payment_id
+               AND refund_payment.status = 'posted'
+              WHERE due_refund.organization_id = due_invoice.organization_id
+                AND refund_allocation.invoice_id = due_invoice.id
+                AND due_refund.status = 'posted'
+            ), 0.00),
+            0.00
+          )
+        - COALESCE((
+            SELECT SUM(due_waiver.waiver_amount)
+            FROM member_membership_invoice_waivers due_waiver
+            WHERE due_waiver.organization_id = due_invoice.organization_id
+              AND due_waiver.invoice_id = due_invoice.id
+              AND due_waiver.status = 'posted'
+          ), 0.00),
+        0.00
+      ) > 0
+  )`;
+
 const CURRENT_MEMBERSHIP_FILTER = `
   m.organization_id = ?
   AND m.membership_plan_id = ?
-  AND m.status = 'active'
-  AND m.start_date <= CURRENT_DATE()
-  AND (m.end_date IS NULL OR m.end_date > CURRENT_DATE())
+  AND (
+    (
+      m.status = 'active'
+      AND m.start_date <= CURRENT_DATE()
+      AND (m.end_date IS NULL OR m.end_date > CURRENT_DATE())
+    )
+    OR (
+      -- Keep existing debt visible after a fixed-term membership expires,
+      -- is suspended, or is cancelled. Financial obligations do not vanish
+      -- simply because access to the gym has ended.
+      m.start_date <= CURRENT_DATE()
+      AND ${OUTSTANDING_INVOICE_EXISTS}
+    )
+  )
 
   AND EXISTS (
     SELECT 1
@@ -407,7 +475,6 @@ const CURRENT_MEMBERSHIP_FILTER = `
       AND primary_link.membership_id = m.id
       AND primary_link.member_id = m.primary_member_id
       AND primary_link.member_role = 'primary'
-      AND primary_link.status = 'active'
   )
 
   AND EXISTS (
@@ -419,6 +486,7 @@ const CURRENT_MEMBERSHIP_FILTER = `
   )
 `;
 const periodLabel = (row) => {
+  if (row.billing_mode_snapshot === 'attendance') return 'Pay per attendance';
   const ongoing = row.validity_type_snapshot === 'ongoing';
 
   const value = Number(
@@ -469,10 +537,11 @@ const getMembershipPlanCollections = (req, res) => withAuditedRead(
     const orgId = context.organizationId;
 
     const [plans] = await connection.query(
-      `SELECT id, plan_code, name, package_type, validity_type
+      `SELECT id, plan_code, name, package_type, validity_type, billing_mode, plan_category
        FROM membership_plans
        WHERE organization_id = ?
          AND id = ?
+         AND plan_category = 'membership'
          AND status = 'active'
        LIMIT 1`,
       [orgId, planId]
@@ -486,10 +555,26 @@ const getMembershipPlanCollections = (req, res) => withAuditedRead(
       );
     }
 
+    await ensureDueMembershipInvoicesForBranch(
+      connection,
+      req,
+      context,
+      planId
+    );
+
+    // Attendance plans are listed in Collections only while at least one
+    // attendance invoice remains unpaid. A member with no visits or fully
+    // settled visits must not appear as owing money.
+    const attendanceDueOnlyFilter = plans[0].billing_mode === 'attendance'
+      ? `AND ${OUTSTANDING_INVOICE_EXISTS}`
+      : '';
+    const membershipFilter = `${CURRENT_MEMBERSHIP_FILTER}
+  ${attendanceDueOnlyFilter}`;
+
     const [countRows] = await connection.query(
       `SELECT COUNT(*) AS total
        FROM member_memberships m
-       WHERE ${CURRENT_MEMBERSHIP_FILTER}`,
+       WHERE ${membershipFilter}`,
       [orgId, planId, context.branchId]
     );
 const total = Number(countRows[0]?.total || 0);
@@ -507,19 +592,20 @@ const total = Number(countRows[0]?.total || 0);
           m.id,
           m.organization_id,
           m.primary_member_id,
+          m.status,
           m.plan_code_snapshot,
           m.plan_name_snapshot,
           m.package_type_snapshot,
           m.validity_type_snapshot,
+          m.billing_mode_snapshot,
           m.duration_value_snapshot,
           m.duration_unit_snapshot,
           m.billing_interval_value_snapshot,
           m.billing_interval_unit_snapshot,
           m.price_snapshot,
-          m.currency_code_snapshot,
-          m.next_billing_date
+          m.currency_code_snapshot
         FROM member_memberships m
-        WHERE ${CURRENT_MEMBERSHIP_FILTER}
+        WHERE ${membershipFilter}
       ),
 
       refunds_by_allocation AS (
@@ -567,6 +653,7 @@ const total = Number(countRows[0]?.total || 0);
           i.organization_id,
           i.membership_id,
           i.due_date,
+          i.billing_period_start,
           i.total_amount,
 
           GREATEST(
@@ -618,8 +705,12 @@ const total = Number(countRows[0]?.total || 0);
           ) AS unpaid_invoice_count,
 
           MIN(
-            CASE WHEN balance_due > 0 THEN due_date ELSE NULL END
-          ) AS earliest_unpaid_due_date
+            CASE WHEN balance_due > 0 THEN billing_period_start ELSE NULL END
+          ) AS earliest_unpaid_period_start,
+
+          MAX(
+            CASE WHEN balance_due > 0 THEN billing_period_start ELSE NULL END
+          ) AS latest_unpaid_period_start
 
         FROM invoice_financials
         GROUP BY organization_id, membership_id
@@ -663,6 +754,7 @@ const total = Number(countRows[0]?.total || 0);
       SELECT
         tm.id AS membership_id,
         tm.primary_member_id AS member_id,
+        tm.status AS membership_status,
 
         primary_member.member_code,
         primary_member.full_name AS member_name,
@@ -671,6 +763,7 @@ const total = Number(countRows[0]?.total || 0);
         tm.plan_name_snapshot AS plan_name,
         tm.package_type_snapshot AS package_type,
         tm.validity_type_snapshot,
+        tm.billing_mode_snapshot,
         tm.duration_value_snapshot,
         tm.duration_unit_snapshot,
         tm.billing_interval_value_snapshot,
@@ -678,11 +771,6 @@ const total = Number(countRows[0]?.total || 0);
 
         tm.price_snapshot AS fee,
         tm.currency_code_snapshot AS currency_code,
-
-        DATE_FORMAT(
-          tm.next_billing_date,
-          '%Y-%m-%d'
-        ) AS next_billing_date,
 
         COALESCE(ap.active_participant_count, 1)
           AS active_participant_count,
@@ -696,9 +784,14 @@ const total = Number(countRows[0]?.total || 0);
         COALESCE(mf.unpaid_invoice_count, 0) AS unpaid_invoice_count,
 
         DATE_FORMAT(
-          mf.earliest_unpaid_due_date,
+          mf.earliest_unpaid_period_start,
           '%Y-%m-%d'
-        ) AS earliest_unpaid_due_date
+        ) AS due_period_start,
+
+        DATE_FORMAT(
+          mf.latest_unpaid_period_start,
+          '%Y-%m-%d'
+        ) AS due_period_end
 
       FROM target_memberships tm
 
@@ -734,19 +827,12 @@ const total = Number(countRows[0]?.total || 0);
       const invoiceCount = Number(row.invoice_count || 0);
       const unpaidCount = Number(row.unpaid_invoice_count || 0);
 
-      const nextDue = unpaidCount > 0
-        ? row.earliest_unpaid_due_date
-        : (
-          row.validity_type_snapshot === 'ongoing'
-            ? row.next_billing_date
-            : null
-        );
-
       const outstanding = String(row.outstanding ?? '0.00');
 
       return {
         membership_id: Number(row.membership_id),
         member_id: Number(row.member_id),
+        membership_status: row.membership_status,
         member_code: row.member_code,
         member_name: row.member_name,
 
@@ -762,7 +848,8 @@ const total = Number(countRows[0]?.total || 0);
         net_paid: String(row.net_paid ?? '0.00'),
         outstanding,
 
-        next_due_date: nextDue,
+        due_period_start: row.due_period_start,
+        due_period_end: row.due_period_end,
 
         invoice_count: invoiceCount,
         unpaid_invoice_count: unpaidCount,
@@ -790,6 +877,7 @@ const total = Number(countRows[0]?.total || 0);
         name: plans[0].name,
         package_type: plans[0].package_type,
         validity_type: plans[0].validity_type,
+        billing_mode: plans[0].billing_mode || 'standard',
       },
 
       collections,
@@ -813,7 +901,210 @@ const total = Number(countRows[0]?.total || 0);
   }
 );
 
+// GET /api/members/billing/program-assignments
+// Read-only branch-scoped report. Program assignments have no
+// membership financial ledger, so this endpoint returns status
+// and date information only.
+const getProgramAssignmentReport = (req, res) => withAuditedRead(
+  req,
+  res,
+  {
+    action: 'PROGRAM_ASSIGNMENT_REPORT_VIEWED',
+    description: 'Viewed branch-scoped program assignment report.',
+    fallbackCode: 'PROGRAM_ASSIGNMENT_REPORT_FAILED',
+    fallbackMessage: 'Unable to load program assignment report.',
+  },
+
+  async (connection, context) => {
+    const rawProgramId = req.query?.program_id;
+    const normalizedProgramId = rawProgramId == null
+      ? ''
+      : String(rawProgramId).trim();
+
+    const programId = normalizedProgramId
+      ? positiveId(normalizedProgramId)
+      : null;
+
+    if (normalizedProgramId && !programId) {
+      throw new CollectionsError(
+        400,
+        'INVALID_PROGRAM_ID',
+        'program_id must be a positive integer.'
+      );
+    }
+
+    const pagination = parsePagination(req.query);
+    const orgId = context.organizationId;
+
+    let program = null;
+
+    if (programId) {
+      const [programRows] = await connection.query(
+        `SELECT id, plan_code, name
+         FROM membership_plans
+         WHERE organization_id = ?
+           AND id = ?
+           AND plan_category = 'program'
+         LIMIT 1`,
+        [orgId, programId]
+      );
+
+      if (!programRows.length) {
+        throw new CollectionsError(
+          404,
+          'PROGRAM_NOT_FOUND',
+          'The selected program was not found in this organization.'
+        );
+      }
+
+      program = {
+        id: Number(programRows[0].id),
+        plan_code: programRows[0].plan_code,
+        name: programRows[0].name,
+      };
+    }
+
+    const filters = [
+      'mpa.organization_id = ?',
+      'mpa.branch_id = ?',
+    ];
+
+    const params = [orgId, context.branchId];
+
+    if (programId) {
+      filters.push('mpa.membership_plan_id = ?');
+      params.push(programId);
+    }
+
+    const whereSql = filters.join('\n       AND ');
+
+    const [countRows] = await connection.query(
+      `SELECT COUNT(*) AS total
+       FROM member_program_assignments mpa
+       WHERE ${whereSql}`,
+      params
+    );
+
+    const total = Number(countRows[0]?.total || 0);
+    const totalPages = Math.max(
+      1,
+      Math.ceil(total / pagination.pageSize)
+    );
+
+    const page = Math.min(pagination.page, totalPages);
+    const offset = (page - 1) * pagination.pageSize;
+
+    const [rows] = await connection.query(
+      `SELECT
+         mpa.id AS assignment_id,
+         mpa.member_id,
+         member.member_code,
+         member.full_name AS member_name,
+         mpa.program_id,
+         mpa.membership_plan_id,
+         mpa.branch_id,
+
+         COALESCE(
+           mp.plan_code,
+           mpa.program_code_snapshot
+         ) AS program_code,
+
+         COALESCE(
+           mp.name,
+           mpa.program_name_snapshot
+         ) AS program_name,
+
+         mpa.duration_value_snapshot AS duration_value,
+         mpa.duration_unit_snapshot AS duration_unit,
+
+         DATE_FORMAT(mpa.start_date, '%Y-%m-%d') AS start_date,
+         DATE_FORMAT(mpa.expected_end_date, '%Y-%m-%d') AS expected_end_date,
+         mpa.status,
+         DATE_FORMAT(mpa.completed_on, '%Y-%m-%d') AS completed_on,
+         DATE_FORMAT(mpa.cancelled_on, '%Y-%m-%d') AS cancelled_on,
+
+         (
+           SELECT DATE_FORMAT(pause_row.paused_on, '%Y-%m-%d')
+           FROM member_program_assignment_pauses pause_row
+           WHERE pause_row.organization_id = mpa.organization_id
+             AND pause_row.assignment_id = mpa.id
+             AND pause_row.resumed_at IS NULL
+             AND pause_row.closed_at IS NULL
+           ORDER BY pause_row.id DESC
+           LIMIT 1
+         ) AS current_pause_on,
+
+         mpa.created_at
+
+       FROM member_program_assignments mpa
+
+       INNER JOIN members member
+         ON member.organization_id = mpa.organization_id
+        AND member.id = mpa.member_id
+
+       LEFT JOIN membership_plans mp
+         ON mp.organization_id = mpa.organization_id
+        AND mp.id = mpa.membership_plan_id
+        AND mp.plan_category = 'program'
+
+       WHERE ${whereSql}
+
+       ORDER BY mpa.start_date DESC, mpa.id DESC
+       LIMIT ? OFFSET ?`,
+      [...params, pagination.pageSize, offset]
+    );
+
+    const assignments = rows.map((row) => ({
+      assignment_id: Number(row.assignment_id),
+      member_id: Number(row.member_id),
+      member_code: row.member_code,
+      member_name: row.member_name,
+
+      program_id: row.program_id == null
+        ? null
+        : Number(row.program_id),
+
+      membership_plan_id: row.membership_plan_id == null
+        ? null
+        : Number(row.membership_plan_id),
+
+      branch_id: Number(row.branch_id),
+      program_code: row.program_code,
+      program_name: row.program_name,
+
+      duration_value: Number(row.duration_value),
+      duration_unit: row.duration_unit,
+
+      start_date: row.start_date,
+      expected_end_date: row.expected_end_date,
+      status: row.status,
+      completed_on: row.completed_on,
+      cancelled_on: row.cancelled_on,
+      current_pause_on: row.current_pause_on,
+      created_at: row.created_at,
+    }));
+
+    return {
+      program,
+      assignments,
+      pagination: {
+        page,
+        page_size: pagination.pageSize,
+        total,
+        total_pages: totalPages,
+      },
+      report_scope: 'active_branch',
+      auditMetadata: {
+        view: 'program_assignment_report',
+        program_id: programId,
+        page,
+        page_size: pagination.pageSize,
+      },
+    };
+  }
+);
 module.exports = {
   getCollectionsSummary,
   getMembershipPlanCollections,
+  getProgramAssignmentReport,
 };
