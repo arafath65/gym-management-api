@@ -50,6 +50,8 @@ router.get(
   '/program-assignments',
   requireGymPermission('member_billing.reports.view'),
   requireGymPermission('member_programs.view'),
+  requireGymPermission('member_program_billing.invoices.view'),
+  requireGymPermission('member_program_billing.payments.view'),
   getProgramAssignmentReport
 );
 

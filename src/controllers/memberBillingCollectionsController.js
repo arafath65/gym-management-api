@@ -1017,6 +1017,39 @@ const getProgramAssignmentReport = (req, res) => withAuditedRead(
          mpa.duration_value_snapshot AS duration_value,
          mpa.duration_unit_snapshot AS duration_unit,
 
+         mpa.fee_snapshot AS fee,
+         mpa.currency_code_snapshot AS currency_code,
+         mpa.price_configured_snapshot AS price_configured,
+
+         mpi.id AS invoice_id,
+         mpi.invoice_number,
+         COALESCE(mpi.total_amount, 0.00) AS total_billed,
+         COALESCE(program_payment_totals.net_paid, 0.00) AS net_paid,
+
+         CASE
+           WHEN mpi.status = 'issued'
+           THEN GREATEST(
+             COALESCE(mpi.total_amount, 0.00)
+             - COALESCE(program_payment_totals.net_paid, 0.00),
+             0.00
+           )
+           ELSE 0.00
+         END AS outstanding,
+
+         CASE
+           WHEN mpi.id IS NULL AND mpa.price_configured_snapshot = 1
+             THEN 'not_invoiced'
+           WHEN mpi.id IS NULL
+             THEN 'not_configured'
+           WHEN mpi.status <> 'issued'
+             THEN mpi.status
+           WHEN COALESCE(program_payment_totals.net_paid, 0.00) >= mpi.total_amount
+             THEN 'paid'
+           WHEN COALESCE(program_payment_totals.net_paid, 0.00) > 0
+             THEN 'partially_paid'
+           ELSE 'unpaid'
+         END AS billing_state,
+
          DATE_FORMAT(mpa.start_date, '%Y-%m-%d') AS start_date,
          DATE_FORMAT(mpa.expected_end_date, '%Y-%m-%d') AS expected_end_date,
          mpa.status,
@@ -1047,6 +1080,22 @@ const getProgramAssignmentReport = (req, res) => withAuditedRead(
         AND mp.id = mpa.membership_plan_id
         AND mp.plan_category = 'program'
 
+       LEFT JOIN member_program_invoices mpi
+         ON mpi.organization_id = mpa.organization_id
+        AND mpi.assignment_id = mpa.id
+
+       LEFT JOIN (
+         SELECT
+           organization_id,
+           invoice_id,
+           SUM(amount) AS net_paid
+         FROM member_program_payments
+         WHERE status = 'posted'
+         GROUP BY organization_id, invoice_id
+       ) program_payment_totals
+         ON program_payment_totals.organization_id = mpi.organization_id
+        AND program_payment_totals.invoice_id = mpi.id
+
        WHERE ${whereSql}
 
        ORDER BY mpa.start_date DESC, mpa.id DESC
@@ -1074,6 +1123,17 @@ const getProgramAssignmentReport = (req, res) => withAuditedRead(
 
       duration_value: Number(row.duration_value),
       duration_unit: row.duration_unit,
+
+      fee: row.fee == null ? null : String(row.fee),
+      currency_code: row.currency_code || null,
+      price_configured: Number(row.price_configured) === 1,
+
+      invoice_id: row.invoice_id == null ? null : Number(row.invoice_id),
+      invoice_number: row.invoice_number || null,
+      total_billed: String(row.total_billed ?? '0.00'),
+      net_paid: String(row.net_paid ?? '0.00'),
+      outstanding: String(row.outstanding ?? '0.00'),
+      billing_state: row.billing_state,
 
       start_date: row.start_date,
       expected_end_date: row.expected_end_date,

@@ -110,6 +110,7 @@ const ensureMember = async (connection, context, forUpdate = false) => {
     `SELECT
        m.id,
        m.member_code,
+       m.full_name,
        m.status,
        m.registration_branch_id,
        b.name AS registration_branch_name,
@@ -191,6 +192,9 @@ const ensureUnifiedProgram = async (
        mp.name,
        mp.duration_value,
        mp.duration_unit,
+       mp.price,
+       mp.currency_code,
+       mp.price_configured,
        mp.status AS plan_status,
        mp.legacy_program_id,
        fp.id AS legacy_program_row_id,
@@ -238,6 +242,9 @@ const ensureUnifiedProgram = async (
     name: row.name,
     duration_value: Number(row.duration_value),
     duration_unit: row.duration_unit,
+    price: row.price == null ? null : String(row.price),
+    currency_code: row.currency_code || null,
+    price_configured: Number(row.price_configured) === 1,
     status: row.plan_status,
   };
 };
@@ -254,6 +261,9 @@ const selectAssignmentSql = `
     program_name_snapshot,
     duration_value_snapshot,
     duration_unit_snapshot,
+    fee_snapshot,
+    currency_code_snapshot,
+    price_configured_snapshot,
     DATE_FORMAT(start_date, '%Y-%m-%d') AS start_date,
     DATE_FORMAT(expected_end_date, '%Y-%m-%d') AS expected_end_date,
     status,
@@ -288,6 +298,9 @@ const serializeAssignment = (row) => ({
   program_name: row.program_name_snapshot,
   duration_value: Number(row.duration_value_snapshot),
   duration_unit: row.duration_unit_snapshot,
+  fee: row.fee_snapshot == null ? null : String(row.fee_snapshot),
+  currency_code: row.currency_code_snapshot || null,
+  price_configured: Number(row.price_configured_snapshot) === 1,
   start_date: row.start_date,
   expected_end_date: row.expected_end_date,
   status: row.status,
@@ -612,7 +625,7 @@ const assignFitnessProgramToMember = async (req, res) => {
       programId = requestedLegacyProgramId;
       program = await ensureProgram(connection, context, programId, true);
       const [mappingRows] = await connection.query(
-        `SELECT id
+        `SELECT id, price, currency_code, price_configured
          FROM membership_plans
          WHERE organization_id = ?
            AND plan_category = 'program'
@@ -620,9 +633,20 @@ const assignFitnessProgramToMember = async (req, res) => {
          LIMIT 1`,
         [context.organizationId, programId]
       );
+
       membershipPlanId = mappingRows.length
         ? Number(mappingRows[0].id)
         : null;
+
+      program = {
+        ...program,
+        price: mappingRows.length && mappingRows[0].price != null
+          ? String(mappingRows[0].price)
+          : null,
+        currency_code: mappingRows[0]?.currency_code || null,
+        price_configured: mappingRows.length
+          && Number(mappingRows[0].price_configured) === 1,
+      };
     }
 
     let startDate = suppliedStartDate;
@@ -653,12 +677,15 @@ const assignFitnessProgramToMember = async (req, res) => {
           program_name_snapshot,
           duration_value_snapshot,
           duration_unit_snapshot,
+          fee_snapshot,
+          currency_code_snapshot,
+          price_configured_snapshot,
           start_date,
           expected_end_date,
           status,
           assigned_by_user_id
         )
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)`,
       [
         context.organizationId,
         context.memberId,
@@ -669,6 +696,9 @@ const assignFitnessProgramToMember = async (req, res) => {
         program.name,
         program.duration_value,
         program.duration_unit,
+        program.price_configured ? program.price : null,
+        program.currency_code,
+        program.price_configured ? 1 : 0,
         startDate,
         expectedEndDate,
         context.userId,
@@ -676,6 +706,79 @@ const assignFitnessProgramToMember = async (req, res) => {
     );
 
     const assignmentId = Number(insertResult.insertId);
+
+    let programInvoiceNumber = null;
+    const programPriceConfigured = program.price_configured === true
+      || Number(program.price_configured) === 1;
+
+    if (programPriceConfigured) {
+      if (
+        program.price == null ||
+        !/^\d{1,10}(\.\d{1,2})?$/.test(String(program.price)) ||
+        !program.currency_code
+      ) {
+        throw new ProgramAssignmentError(
+          409,
+          'INVALID_PROGRAM_FEE_CONFIGURATION',
+          'The selected program has an invalid configured fee or currency.'
+        );
+      }
+
+      const [invoiceYearRows] = await connection.query(
+        'SELECT YEAR(CURRENT_DATE()) AS invoice_year'
+      );
+
+      const invoiceYear = Number(invoiceYearRows[0]?.invoice_year);
+
+      if (!Number.isInteger(invoiceYear) || invoiceYear < 2000) {
+        throw new Error('Unable to determine program invoice year.');
+      }
+
+      programInvoiceNumber =
+        `PGI-${invoiceYear}-${String(assignmentId).padStart(8, '0')}`;
+
+      await connection.query(
+        `INSERT INTO member_program_invoices
+          (
+            organization_id,
+            assignment_id,
+            member_id,
+            branch_id,
+            invoice_number,
+            program_code_snapshot,
+            program_name_snapshot,
+            member_code_snapshot,
+            member_name_snapshot,
+            invoice_date,
+            due_date,
+            total_amount,
+            currency_code,
+            status,
+            created_by_user_id,
+            updated_by_user_id
+          )
+         VALUES
+          (
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_DATE(),
+            CURRENT_DATE(), ?, ?, 'issued', ?, ?
+          )`,
+        [
+          context.organizationId,
+          assignmentId,
+          context.memberId,
+          context.branchId,
+          programInvoiceNumber,
+          program.program_code,
+          program.name,
+          member.member_code,
+          member.full_name,
+          String(program.price),
+          program.currency_code,
+          context.userId,
+          context.userId,
+        ]
+      );
+    }
 
     const assignment = await ensureAssignment(
       connection,
@@ -702,6 +805,9 @@ const assignFitnessProgramToMember = async (req, res) => {
         program_name: program.name,
         duration_value: Number(program.duration_value),
         duration_unit: program.duration_unit,
+        fee: programPriceConfigured ? String(program.price) : null,
+        currency_code: program.currency_code || null,
+        invoice_number: programInvoiceNumber,
         start_date: startDate,
         expected_end_date: expectedEndDate,
         status: 'active',
@@ -714,6 +820,9 @@ const assignFitnessProgramToMember = async (req, res) => {
           membership_plan_id: membershipPlanId,
           program_code: program.program_code,
           program_name: program.name,
+          fee: programPriceConfigured ? String(program.price) : null,
+          currency_code: program.currency_code || null,
+          invoice_number: programInvoiceNumber,
           assigned_branch_id: context.branchId,
         },
       }),
