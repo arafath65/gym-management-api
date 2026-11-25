@@ -484,7 +484,12 @@ const loadAttendanceMetrics = async (
     `SELECT
        attendance.branch_id,
        branch.name AS branch_name,
-       COUNT(*) AS total
+       COUNT(DISTINCT attendance.member_id) AS visitors,
+       COUNT(DISTINCT CASE
+         WHEN attendance.attendance_status = 'open'
+          AND attendance.checked_out_at IS NULL
+         THEN attendance.member_id
+       END) AS currently_inside
      FROM member_attendance attendance
      INNER JOIN branches branch
        ON branch.organization_id = attendance.organization_id
@@ -498,20 +503,50 @@ const loadAttendanceMetrics = async (
   );
 
   const counts = new Map(
-    rows.map((row) => [Number(row.branch_id), Number(row.total || 0)])
+    rows.map((row) => [
+      Number(row.branch_id),
+      {
+        visitors: Number(row.visitors || 0),
+        currently_inside: Number(row.currently_inside || 0),
+      },
+    ])
   );
 
-  const byBranch = scope.branches.map((branch) => ({
-    branch_id: branch.id,
-    branch_name: branch.name,
-    check_ins: counts.get(branch.id) || 0,
-  }));
+  const byBranch = scope.branches.map((branch) => {
+    const branchCounts = counts.get(branch.id) || {
+      visitors: 0,
+      currently_inside: 0,
+    };
+
+    return {
+      branch_id: branch.id,
+      branch_name: branch.name,
+
+      // Retain the previous field for existing dashboard consumers.
+      check_ins: branchCounts.visitors,
+
+      visitors: branchCounts.visitors,
+      currently_inside: branchCounts.currently_inside,
+    };
+  });
+
+  const todayVisitors = byBranch.reduce(
+    (sum, row) => sum + row.visitors,
+    0
+  );
+
+  const currentlyInside = byBranch.reduce(
+    (sum, row) => sum + row.currently_inside,
+    0
+  );
 
   return {
-    today_check_ins: byBranch.reduce(
-      (sum, row) => sum + row.check_ins,
-      0
-    ),
+    today_visitors: todayVisitors,
+    currently_inside: currentlyInside,
+
+    // Backward-compatible alias.
+    today_check_ins: todayVisitors,
+
     by_branch: byBranch,
   };
 };
@@ -907,6 +942,8 @@ const emptyMembershipMetrics = () => ({
 });
 
 const emptyAttendanceMetrics = () => ({
+  today_visitors: 0,
+  currently_inside: 0,
   today_check_ins: 0,
   by_branch: [],
 });
