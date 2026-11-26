@@ -46,6 +46,14 @@ const listMembers = async (req, res) => {
     const organizationId = Number(req.gymStaff?.organizationId);
     const branchId = Number(req.gymStaff?.branchId);
 
+    console.info("[MEMBER-LIST-DEBUG] Request received", {
+      organizationId,
+      activeBranchId: branchId,
+      userId: Number(req.gymStaff?.userId),
+      requestedPage: req.query.page ?? 1,
+      status: req.query.status ?? "all",
+    });
+
     if (
       !Number.isSafeInteger(organizationId) || organizationId <= 0 ||
       !Number.isSafeInteger(branchId) || branchId <= 0

@@ -630,6 +630,12 @@ const switchGymStaffBranch = async (req, res) => {
 
     const previousBranchId = Number(req.gymStaff.branchId);
 
+    console.info("[BRANCH-DEBUG] Switch requested", {
+      organizationId: Number(req.gymStaff.organizationId),
+      previousBranchId,
+      requestedBranchId: branchId,
+    });
+
     if (previousBranchId === branchId) {
       return res.status(400).json({
         success: false,
@@ -645,6 +651,13 @@ const switchGymStaffBranch = async (req, res) => {
       req,
       auditAction: "GYM_STAFF_BRANCH_SWITCH",
       previousBranchId,
+    });
+
+    console.info("[BRANCH-DEBUG] Switch session created", {
+      organizationId: Number(req.gymStaff.organizationId),
+      previousBranchId,
+      issuedBranchId: session.branch?.id ?? null,
+      issuedBranchName: session.branch?.name ?? null,
     });
 
     return res.json({
