@@ -1,5 +1,9 @@
 
 const express = require("express");
+const db = require("../config/db");
+const {
+  readGymProfileLogo,
+} = require("../services/storage/gymProfileLogoStorage");
 
 const {
   activateDevice,
@@ -51,6 +55,97 @@ router.get("/validate", authenticateDevice, (req, res) => {
   });
 });
 
+
+// Get organization branding using the activated device token.
+router.get("/branding", authenticateDevice, async (req, res) => {
+  try {
+    const organizationId = Number(req.device.organizationId);
+
+    const [rows] = await db.query(
+      `SELECT id, name, logo_storage_key
+       FROM organizations
+       WHERE id = ?
+       LIMIT 1`,
+      [organizationId]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({
+        success: false,
+        message: "Gym organization was not found.",
+      });
+    }
+
+    const organization = rows[0];
+
+    res.set("Cache-Control", "private, no-store");
+
+    return res.json({
+      success: true,
+      organization: {
+        id: Number(organization.id),
+        name: organization.name || req.device.organizationName || "",
+        hasLogo: Boolean(organization.logo_storage_key),
+      },
+    });
+  } catch (error) {
+    console.error("Get device branding error:", error.message);
+
+    return res.status(500).json({
+      success: false,
+      message: "Unable to load organization branding.",
+    });
+  }
+});
+
+// Retrieve the organization's private logo using the device token.
+router.get("/branding/logo", authenticateDevice, async (req, res) => {
+  try {
+    const organizationId = Number(req.device.organizationId);
+
+    const [rows] = await db.query(
+      `SELECT logo_storage_key
+       FROM organizations
+       WHERE id = ?
+       LIMIT 1`,
+      [organizationId]
+    );
+
+    if (!rows.length || !rows[0].logo_storage_key) {
+      return res.status(404).json({
+        success: false,
+        message: "Gym logo has not been uploaded.",
+      });
+    }
+
+    const imageBuffer = await readGymProfileLogo(
+      organizationId,
+      rows[0].logo_storage_key
+    );
+
+    res.set("Content-Type", "image/webp");
+    res.set("Content-Length", String(imageBuffer.length));
+    res.set("Content-Disposition", "inline");
+    res.set("Cache-Control", "private, no-store");
+    res.set("X-Content-Type-Options", "nosniff");
+
+    return res.send(imageBuffer);
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return res.status(404).json({
+        success: false,
+        message: "Gym logo file was not found.",
+      });
+    }
+
+    console.error("Get device branding logo error:", error.message);
+
+    return res.status(500).json({
+      success: false,
+      message: "Unable to retrieve organization logo.",
+    });
+  }
+});
 // All device management operations below require Platform Admin.
 router.use(authenticatePlatformAdmin);
 
